@@ -89,6 +89,39 @@ _SSL_CTX.verify_mode = ssl.CERT_NONE
 
 PUA_RE = re.compile(r"[\ue000-\uf8ff]", re.IGNORECASE)
 
+# 正文里的图片保留为标记，油猴脚本负责渲染（与 appchannel.py 保持一致）
+IMG_TOKEN = "[fqimg]%s[/fqimg]"
+_RE_IMG = re.compile(r"(?is)<img\b[^>]*>")
+_IMG_URL_ATTRS = ("src", "data-src", "data-original", "data-lazy-src",
+                  "data-url", "data-source", "original", "lazy-src",
+                  "srcset", "data-srcset")
+_RE_IMG_ATTR = re.compile(
+    r"(?is)\b(" + "|".join(_IMG_URL_ATTRS) + r")\s*=\s*"
+    r"(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))"
+)
+
+
+def image_url_from_tag(tag):
+    attrs = {}
+    for m in _RE_IMG_ATTR.finditer(tag):
+        attrs.setdefault(m.group(1).lower(), m.group(2) or m.group(3) or m.group(4) or "")
+    for key in _IMG_URL_ATTRS:
+        raw = _html.unescape(attrs.get(key, "")).strip()
+        if not raw:
+            continue
+        if key.endswith("srcset"):
+            parts = raw.split(",")[0].strip().split()
+            raw = parts[0] if parts else ""
+            if not raw:
+                continue
+        if raw.startswith("//"):
+            raw = "https:" + raw
+        elif raw.startswith("/") and not raw.startswith("//"):
+            raw = "https://fanqienovel.com" + raw
+        if re.match(r"(?i)^https?://", raw) or re.match(r"(?i)^data:image/", raw):
+            return raw
+    return ""
+
 
 def dec_text(s):
     """把字符串里的私有区（PUA）码点还原为真实汉字（内容正文用 FONT_MAP）。"""
@@ -296,8 +329,23 @@ def decode_content(html):
     html = dec_text(html)
     html = re.sub(r"(?i)</p>", "\n", html)
     html = re.sub(r"(?i)<br\s*/?>", "\n", html)
-    html = re.sub(r"<[^>]+>", "", html)  # 去掉其余标签（含 <img>/<style>）
+
+    # 图片先占位，避免被下面的通用标签清理删掉
+    imgs = []
+
+    def keep_img(match):
+        url = image_url_from_tag(match.group(0))
+        if not url:
+            return ""
+        key = "\x00FQIMG%d\x00" % len(imgs)
+        imgs.append(url)
+        return key
+
+    html = _RE_IMG.sub(keep_img, html)
+    html = re.sub(r"<[^>]+>", "", html)  # 去掉其余标签（<style> 等）
     html = _html.unescape(html)
+    for i, url in enumerate(imgs):
+        html = html.replace("\x00FQIMG%d\x00" % i, IMG_TOKEN % url)
     return html.strip()
 
 
@@ -309,6 +357,8 @@ def fetch_chapter(item_id):
             return {"code": 0,
                     "data": {"content": r["content"],
                              "title": r["title"],
+                             "book_id": r.get("book_id") or "",
+                             "book_name": r.get("book_name") or "",
                              "word_number": len(r["content"]),
                              "is_locked": False,
                              "preview": False,
@@ -343,6 +393,8 @@ def fetch_chapter_web(item_id):
                          % (item_id, len(text), words))
     return {"code": 0,
             "data": {"content": text,
+                     "book_id": str(cd.get("bookId") or ""),
+                     "book_name": cd.get("bookName") or "",
                      "word_number": words,
                      "is_locked": bool(cd.get("isChapterLock")),
                      "preview": preview}}

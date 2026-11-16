@@ -329,13 +329,48 @@ _RE_HEADER = re.compile(r"(?is)<header>(.*?)</header>")
 _RE_ARTICLE = re.compile(r"(?is)<article>(.*?)</article>")
 _RE_P_OPEN = re.compile(r"(?i)<p[^>]*>")
 _RE_BR = re.compile(r"(?i)<br\s*/?>")
-_RE_IMG = re.compile(r"(?is)<img[^>]*>")
+_RE_IMG = re.compile(r"(?is)<img\b[^>]*>")
 _RE_TAG = re.compile(r"(?s)<[^>]+>")
 _RE_SPACES = re.compile(r"[ \t\u00a0\u200b\ufeff\u3000]+")
 
+# 正文里保留图片用的标记，油猴脚本会把它渲染成 <img>
+IMG_TOKEN = "[fqimg]%s[/fqimg]"
+
+# 常见图片地址属性，按优先级排列
+_IMG_URL_ATTRS = ("src", "data-src", "data-original", "data-lazy-src",
+                  "data-url", "data-source", "original", "lazy-src",
+                  "srcset", "data-srcset")
+_RE_IMG_ATTR = re.compile(
+    r"(?is)\b(" + "|".join(_IMG_URL_ATTRS) + r")\s*=\s*"
+    r"(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))"
+)
+
+
+def image_url_from_tag(tag):
+    """从 <img ...> 中挑出可用的图片地址，失败返回空串。"""
+    attrs = {}
+    for m in _RE_IMG_ATTR.finditer(tag):
+        attrs.setdefault(m.group(1).lower(), m.group(2) or m.group(3) or m.group(4) or "")
+    for key in _IMG_URL_ATTRS:
+        raw = _html.unescape(attrs.get(key, "")).strip()
+        if not raw:
+            continue
+        if key.endswith("srcset"):
+            raw = raw.split(",")[0].strip().split()
+            raw = raw[0] if raw else ""
+            if not raw:
+                continue
+        if raw.startswith("//"):
+            raw = "https:" + raw
+        elif raw.startswith("/") and not raw.startswith("//"):
+            raw = "https://fanqienovel.com" + raw
+        if re.match(r"(?i)^https?://", raw) or re.match(r"(?i)^data:image/", raw):
+            return raw
+    return ""
+
 
 def clean_content(html):
-    """把 App 渠道的正文 HTML 转成 {title, text}。"""
+    """把 App 渠道的正文 HTML 转成 {title, text}（图片保留为标记）。"""
     title = ""
     m = _RE_HEADER.search(html)
     if m:
@@ -344,10 +379,25 @@ def clean_content(html):
     body = m.group(1) if m else html
     body = _RE_P_OPEN.sub("\n", body)
     body = _RE_BR.sub("\n", body)
-    body = _RE_IMG.sub("", body)
+
+    # 先用不可能出现在正文里的占位符保护图片，等其它标签都清掉后再还原
+    imgs = []
+
+    def keep_img(match):
+        url = image_url_from_tag(match.group(0))
+        if not url:
+            return ""
+        key = "\x00FQIMG%d\x00" % len(imgs)
+        imgs.append(url)
+        return key
+
+    body = _RE_IMG.sub(keep_img, body)
     body = _RE_TAG.sub("", body)
     body = _html.unescape(body)
     body = _RE_SPACES.sub(" ", body)
+    for i, url in enumerate(imgs):
+        body = body.replace("\x00FQIMG%d\x00" % i, IMG_TOKEN % url)
+
     lines = [ln.strip() for ln in body.split("\n")]
     return title, "\n".join(ln for ln in lines if ln)
 
@@ -423,7 +473,10 @@ def _fetch_once(item_id, timeout):
     title, text = clean_content(html)
     if not text:
         raise RuntimeError("解密后的正文为空")
+    novel = data.get("novel_data") or {}
     return {"title": title or data.get("title") or "",
             "content": text,
             "raw_html": html,
-            "pay_status": data.get("pay_status")}
+            "pay_status": data.get("pay_status"),
+            "book_id": str(novel.get("book_id") or ""),
+            "book_name": novel.get("book_name") or ""}
