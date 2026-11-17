@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name             番茄全文在线免费读
-// @version          5.7.2-progress
-// @description       自建后端替换番茄网页正文：锁章全文、正文图片、阅读页「下载全文」、详情页一键下载全本；v5.7.2：修复正文区偶尔空白（加载看守/自愈/超时）
-// @description:zh-cn 自建后端替换番茄网页正文：锁章全文、正文图片、阅读页「下载全文」、详情页一键下载全本；v5.7.2：修复正文区偶尔空白（加载看守/自愈/超时）
-// @description:en    Replace fanqienovel web content with a self-hosted API; locked chapters, images, full-book download; v5.7.2: fix occasional blank reader content
+// @version          5.7.3-progress
+// @description       自建后端替换番茄网页正文：锁章全文、正文图片、阅读页「下载全文」、详情页一键下载全本；v5.7.3：阅读控制面板可收起到侧边
+// @description:zh-cn 自建后端替换番茄网页正文：锁章全文、正文图片、阅读页「下载全文」、详情页一键下载全本；v5.7.3：阅读控制面板可收起到侧边
+// @description:en    Replace fanqienovel web content with a self-hosted API; locked chapters, images, full-book download; v5.7.3: collapse reader controls to side rail
 // @author            ibxff / 修改版
 // @license           MIT
 // @match             https://fanqienovel.com/*
@@ -486,7 +486,8 @@
       'border:1px solid rgba(0,0,0,.06);box-shadow:0 6px 22px rgba(0,0,0,.18);',
       'font:12px/1.5 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;',
       'user-select:none;}',
-      '#fq-autoread .fq-ar-head{font-weight:600;font-size:12px;margin-bottom:6px;}',
+      '#fq-autoread .fq-ar-head{display:flex;align-items:center;justify-content:space-between;',
+      'gap:8px;font-weight:600;font-size:12px;margin-bottom:6px;}',
       '#fq-autoread button{cursor:pointer;border:1px solid #ddd;background:#fafafa;color:#444;',
       'border-radius:5px;padding:4px 6px;font-size:12px;}',
       '#fq-autoread .fq-ar-toggle{width:100%;padding:6px 0;background:#ff6a00;color:#fff;',
@@ -511,6 +512,25 @@
       '#fq-autoread .fq-tts-voice{width:100%;margin-top:3px;padding:4px 6px;font-size:12px;',
       'border:1px solid #ddd;border-radius:5px;background:#fff;color:#444;}',
       '#fq-autoread .fq-tts-status{color:#888;font-size:11px;margin-top:6px;}',
+      '#fq-autoread .fq-ar-collapse{padding:2px 6px !important;font-size:11px !important;',
+      'line-height:1.2;flex:0 0 auto;}',
+      '#fq-autoread .fq-ar-rail{display:none;}',
+      '#fq-autoread.fq-collapsed{right:0;top:50%;transform:translateY(-50%);width:34px;',
+      'padding:8px 0;border-radius:10px 0 0 10px;box-shadow:-4px 0 16px rgba(0,0,0,.18);}',
+      '#fq-autoread.fq-collapsed .fq-ar-head,',
+      '#fq-autoread.fq-collapsed .fq-ar-body{display:none;}',
+      '#fq-autoread.fq-collapsed .fq-ar-rail{display:flex;flex-direction:column;',
+      'align-items:center;gap:8px;}',
+      '#fq-autoread .fq-ar-rail-btn{width:26px;height:86px;padding:0 !important;border:0 !important;',
+      'background:linear-gradient(180deg,#ff6a00,#1976d2) !important;color:#fff !important;',
+      'border-radius:6px 0 0 6px;font-size:12px !important;line-height:1.2;',
+      'writing-mode:vertical-rl;letter-spacing:2px;}',
+      '#fq-autoread .fq-ar-rail-dots{display:flex;flex-direction:column;gap:5px;align-items:center;cursor:pointer;}',
+      '#fq-autoread .fq-ar-rail-dot{width:8px;height:8px;border-radius:50%;background:#ddd;}',
+      '#fq-autoread .fq-ar-rail-dot.fq-dot-ar.ar-on{background:#ff6a00;',
+      'box-shadow:0 0 0 2px rgba(255,106,0,.2);}',
+      '#fq-autoread .fq-ar-rail-dot.fq-dot-tts.tts-on{background:#1976d2;',
+      'box-shadow:0 0 0 2px rgba(25,118,210,.2);}',
       '.muye-reader-content p.fq-speaking{background:rgba(255,106,0,.12);',
       'border-radius:4px;box-shadow:0 0 0 4px rgba(255,106,0,.12);}'
     ].join('\n');
@@ -854,7 +874,31 @@
       val.textContent = fmtSpeed(autoRead.speed);
       val.title = Math.round(autoRead.speed * AUTO_BASE_PX) + ' px/秒';
     }
+    var dot = p.querySelector('.fq-dot-ar');
+    if (dot) {
+      dot.className = 'fq-ar-rail-dot fq-dot-ar' + (autoRead.on ? ' ar-on' : '');
+      dot.title = autoRead.on ? '自动阅读中' : '自动阅读未开启';
+    }
   }
+
+  function setAutoReadCollapsed(collapsed) {
+    collapsed = !!collapsed;
+    ssSet('fq_autoread_collapsed', collapsed ? '1' : '0');
+    var p = autoRead.panel;
+    if (!p) return;
+    if (collapsed) p.classList.add('fq-collapsed');
+    else p.classList.remove('fq-collapsed');
+    var btn = p.querySelector('.fq-ar-collapse');
+    if (btn) {
+      btn.textContent = collapsed ? '展开' : '收起';
+      btn.title = collapsed ? '展开阅读控制面板' : '收入右侧边栏';
+    }
+    updateAutoReadPanel();
+    updateSpeechPanel();
+  }
+
+  function collapseAutoReadPanel() { setAutoReadCollapsed(true); }
+  function expandAutoReadPanel() { setAutoReadCollapsed(false); }
 
   function ensureAutoReadPanel() {
     if (!isReader() || !document.body) return;
@@ -865,13 +909,48 @@
 
     var head = document.createElement('div');
     head.className = 'fq-ar-head';
-    head.textContent = '自动阅读';
+    var headTitle = document.createElement('span');
+    headTitle.textContent = '阅读控制';
+    head.appendChild(headTitle);
+    var collapseBtn = document.createElement('button');
+    collapseBtn.type = 'button';
+    collapseBtn.className = 'fq-ar-collapse';
+    collapseBtn.title = '收入右侧边栏';
+    collapseBtn.addEventListener('click', collapseAutoReadPanel);
+    head.appendChild(collapseBtn);
     p.appendChild(head);
+
+    var rail = document.createElement('div');
+    rail.className = 'fq-ar-rail';
+    var railBtn = document.createElement('button');
+    railBtn.type = 'button';
+    railBtn.className = 'fq-ar-rail-btn';
+    railBtn.textContent = '阅读控制';
+    railBtn.title = '展开自动阅读 / 语音朗读面板';
+    railBtn.addEventListener('click', expandAutoReadPanel);
+    rail.appendChild(railBtn);
+    var railDots = document.createElement('div');
+    railDots.className = 'fq-ar-rail-dots';
+    var dotAr = document.createElement('div');
+    dotAr.className = 'fq-ar-rail-dot fq-dot-ar';
+    dotAr.title = '自动阅读状态';
+    railDots.appendChild(dotAr);
+    var dotTts = document.createElement('div');
+    dotTts.className = 'fq-ar-rail-dot fq-dot-tts';
+    dotTts.title = '语音朗读状态';
+    railDots.appendChild(dotTts);
+    railDots.addEventListener('click', expandAutoReadPanel);
+    rail.appendChild(railDots);
+    p.appendChild(rail);
+
+    var body = document.createElement('div');
+    body.className = 'fq-ar-body';
+    p.appendChild(body);
 
     var toggle = document.createElement('button');
     toggle.className = 'fq-ar-toggle';
     toggle.addEventListener('click', toggleAutoRead);
-    p.appendChild(toggle);
+    body.appendChild(toggle);
 
     var row = document.createElement('div');
     row.className = 'fq-ar-row';
@@ -894,12 +973,12 @@
     speedVal.textContent = fmtSpeed(autoRead.speed);
     row.appendChild(speedVal);
 
-    p.appendChild(row);
+    body.appendChild(row);
 
     var hint = document.createElement('div');
     hint.className = 'fq-ar-hint';
     hint.textContent = '章末自动下一章 · 手动滚动会暂停';
-    p.appendChild(hint);
+    body.appendChild(hint);
 
     var ttsBox = document.createElement('div');
     ttsBox.className = 'fq-tts-box';
@@ -963,10 +1042,11 @@
     ttsSeekHint.textContent = '朗读时用鼠标选中文字，从选中处续读';
     ttsBox.appendChild(ttsSeekHint);
 
-    p.appendChild(ttsBox);
+    body.appendChild(ttsBox);
 
     document.body.appendChild(p);
     autoRead.panel = p;
+    setAutoReadCollapsed(ssGet('fq_autoread_collapsed') === '1');
     ensureVoicesListener();
     refreshVoiceSelect();
     updateAutoReadPanel();
@@ -1377,6 +1457,12 @@
 
     var sel = p.querySelector('.fq-tts-voice');
     if (sel && tts.voiceURI && sel.value !== tts.voiceURI) sel.value = tts.voiceURI;
+
+    var dot = p.querySelector('.fq-dot-tts');
+    if (dot) {
+      dot.className = 'fq-ar-rail-dot fq-dot-tts' + (tts.speaking ? ' tts-on' : '');
+      dot.title = tts.speaking ? (tts.paused ? '语音朗读已暂停' : '语音朗读中') : '语音朗读未开启';
+    }
   }
 
   function speakParagraph(i, offset) {
@@ -1783,9 +1869,17 @@
         showBadge('已在阅读面板中展开声音列表', 'info');
       });
     }
-    if (isReader()) {
-      removePanel();
-      watchReader();
+      GM_registerMenuCommand('展开 / 收起阅读控制面板', function () {
+        if (!isReader()) {
+          showBadge('请到小说阅读页再使用阅读控制面板', 'warn');
+          return;
+        }
+        ensureAutoReadPanel();
+        setAutoReadCollapsed(!autoRead.panel.classList.contains('fq-collapsed'));
+      });
+      if (isReader()) {
+        removePanel();
+        watchReader();
     } else if (isBookPage()) {
       removePanel();
       removeAutoReadPanel();
