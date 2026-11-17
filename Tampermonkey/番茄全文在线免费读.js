@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name             番茄全文在线免费读
-// @version          5.8.3-progress
+// @version          5.8.4-tts-continue
 // @description       自建后端替换番茄网页正文：锁章全文、正文图片、阅读进度上报、阅读页「下载全文」、详情页一键下载全本；所有书自动替换正文并上报进度，「脚本读」按钮仅给受限书提供手动入口；阅读页左上角返回统一回书架
 // @description:zh-cn 自建后端替换番茄网页正文：锁章全文、正文图片、阅读进度上报、阅读页「下载全文」、详情页一键下载全本；所有书自动替换正文并上报进度，「脚本读」按钮仅给受限书提供手动入口；阅读页左上角返回统一回书架
 // @description:en    Replace fanqienovel web content with a self-hosted API; locked chapters, images, progress report, full-book download; all books auto-replace content & report progress, "Script read" button only for copyright-restricted books; reader back button always goes to bookshelf
@@ -1613,6 +1613,7 @@
         if (tts.pendingStartOnLoad) {
           tts.pendingStartOnLoad = false;
           tts.continuous = false;
+          ssSet(TTS_NEXT_KEY, '');
           stopSpeech(true);
         }
       }
@@ -1745,10 +1746,13 @@
     voicesListenerInstalled: false,
     hooksInstalled: false,
     continuous: false,          // 朗读完是否自动翻下一章继续听
-    pendingStartOnLoad: false
+    pendingStartOnLoad: false,
+    lastAutoStart: 0            // 避免同一次加载被多个通知重复启动/重启朗读
   };
 
   var TTS_POS_KEY = 'fq_tts_pos_v1';
+  // 翻章会重新加载页面，内存里的 pendingStartOnLoad 会丢失，必须跨页保存
+  var TTS_NEXT_KEY = 'fq_tts_pending_next_v1';
   var TTS_CHUNK_LEN = 56;       // 约 10 秒/句（1.0x），降低 Chrome 长文本中断概率
 
   function ttsSupported() {
@@ -2210,6 +2214,8 @@
 
     tts.speaking = true;
     tts.paused = false;
+    tts.lastAutoStart = Date.now();
+    ssSet(TTS_NEXT_KEY, '');
     tts.unitIndex = startUnit;
     tts.unitOffset = startOffset;
     tts.index = tts.units[startUnit].pIndex;
@@ -2240,6 +2246,7 @@
     tts.pendingStartOnLoad = false;
     tts.continuous = false;
     tts.retry = 0;
+    ssSet(TTS_NEXT_KEY, '');
     cancelCurrentUtterance();
     stopSpeechKeepAlive();
     clearSpeechHighlight();
@@ -2307,6 +2314,7 @@
     updateSpeechPanel();
     if (tts.continuous && isReader()) {
       tts.pendingStartOnLoad = true;
+      ssSet(TTS_NEXT_KEY, '1');
       showBadge('本章朗读完毕，正在翻到下一章…', 'info');
       advanceChapter();
     } else {
@@ -2315,8 +2323,13 @@
   }
 
   function notifySpeechContentLoaded() {
-    if (tts.pendingStartOnLoad) {
+    // 同一次正文加载会被 watch/runReader 通知两次，避免刚启动就被 cancel 掉
+    if (tts.speaking && Date.now() - tts.lastAutoStart < 2000) return;
+    // 翻章后是全新页面，pending 标记存在 sessionStorage 里
+    var pending = tts.pendingStartOnLoad || ssGet(TTS_NEXT_KEY) === '1';
+    if (pending) {
       tts.pendingStartOnLoad = false;
+      ssSet(TTS_NEXT_KEY, '');
       startSpeech(true, true);
     } else if (tts.speaking) {
       // 手动切章时正在朗读，改读新章
