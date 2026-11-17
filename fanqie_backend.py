@@ -3,8 +3,12 @@
 """
 番茄小说 代理后端（纯 Python）。
 
-目录/搜索/详情走 fanqienovel.com 网页接口：
-  - 搜索  /api/author/search/search_book/v1   （需要 a_bogus 网页签名，本地生成）
+目录/搜索/详情优先 App 渠道（参考 shareBookSource.json）：
+  - 搜索  novel.snssdk.com/api/novel/channel/homepage/search/search/v1（免签名）
+  - 详情  reading.snssdk.com/reading/bookapi/detail/v          （X-Gorgon + 设备注册）
+  - 目录  reading.snssdk.com/reading/bookapi/directory/all_items/v（X-Gorgon + 设备注册）
+App 详情/目录若因签名、设备或环境返回空响应，则自动回退原 Web 接口：
+  - 搜索  /api/author/search/search_book/v1 （需要 a_bogus 网页签名，本地生成）
   - 详情  /api/book/info                       （免签名）
   - 目录  /api/reader/directory/detail         （免签名）
 
@@ -35,6 +39,9 @@ import html as _html
 import ssl
 import socket
 import time
+import base64
+import gzip
+import hashlib
 import threading
 import urllib.parse
 import urllib.request
@@ -81,6 +88,10 @@ COOKIE = os.environ.get("FQ_COOKIE", "").strip()
 # 正文渠道：app（默认，走 DH 加密通道，锁章也能拿全文）| web（旧的网页接口）
 # 用 FQ_CHANNEL=web 或 --channel=web 关闭 App 渠道。
 CHANNEL = os.environ.get("FQ_CHANNEL", "app").strip().lower() or "app"
+
+# 元数据渠道（搜索/详情/目录）：app 优先，失败自动回退 web。
+# 用 FQ_META_CHANNEL=web 或 --meta-channel=web 可强制走旧网页接口。
+META_CHANNEL = os.environ.get("FQ_META_CHANNEL", "app").strip().lower() or "app"
 
 # 全局 SSL 上下文（对部分环境放宽校验）
 _SSL_CTX = ssl.create_default_context()
@@ -155,6 +166,223 @@ def http_get_json(url, headers=None, timeout=20):
 
 
 # --------------------------------------------------------------------------
+# App 渠道元数据（搜索 / 详情 / 目录，参考 shareBookSource.json）
+# --------------------------------------------------------------------------
+APP_UA = "com.dragon.read"
+APP_META_HOST = "https://reading.snssdk.com"
+_APP_DEVICE_HEADER = None
+_APP_DEVICE_LOCK = threading.Lock()
+
+
+def _app_http_get(url, headers=None, timeout=10):
+    h = {"User-Agent": APP_UA}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h)
+    resp = urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX)
+    body = resp.read()
+    if ((resp.headers.get("content-encoding") or "").lower() == "gzip"
+            or body[:2] == b"\x1f\x8b"):
+        body = gzip.decompress(body)
+    return body.decode("utf-8", "ignore")
+
+
+def _app_tt_encrypt(data):
+    """设备注册的 TT 加密（ shareBookSource.json 的 TT() 移植）。"""
+    if appchannel is None:
+        raise RuntimeError("appchannel 不可用，无法注册 App 设备")
+    const_key = base64.b64decode(
+        "TdTC5rgxYgkOUrPHpnM7pByyRiuCmrWKGWs521cXdST0m69/"
+        "COjWjSanLjfBqVovHwWlGJKu8pSXMrYqOKrdWA==")
+    value = os.urandom(32)
+    arr = hashlib.sha512(hashlib.sha512(value).digest() + const_key).digest()
+    key, iv = arr[:16], arr[16:32]
+    gz = gzip.compress(data.encode("utf-8"), mtime=0)
+    plain = hashlib.sha512(gz).digest() + gz
+    ct = appchannel._aes_cbc_enc(appchannel._pkcs7_align(plain), key, iv)
+    return bytes([116, 99, 5, 16, 0, 0]) + value + ct
+
+
+def _app_device_header():
+    """注册/缓存 device_id & iid，返回 xGorgon 所需的公共参数串。"""
+    global _APP_DEVICE_HEADER
+    with _APP_DEVICE_LOCK:
+        if _APP_DEVICE_HEADER:
+            return _APP_DEVICE_HEADER
+        android_id = os.urandom(8).hex()
+        digest = hashlib.md5(android_id.encode("ascii")).hexdigest()
+        openudid = (digest + digest[:8]).lower()
+        model = "25053RT47C"
+        payload = {
+            "header": {
+                "package": "com.dragon.read",
+                "openudid": openudid,
+                "device_model": model,
+            }
+        }
+        body = _app_tt_encrypt(json.dumps(payload, ensure_ascii=False,
+                                          separators=(",", ":")))
+        req = urllib.request.Request(
+            "https://i.snssdk.com/service/2/device_register/",
+            data=body,
+            method="POST",
+            headers={"User-Agent": APP_UA, "Content-Type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=10, context=_SSL_CTX)
+        j = json.loads(resp.read().decode("utf-8", "ignore"))
+        device_id = str(j.get("device_id_str") or j.get("device_id") or "")
+        install_id = str(j.get("install_id_str") or j.get("install_id") or "")
+        if not device_id or not install_id:
+            raise RuntimeError("App 设备注册响应缺少 device_id/install_id")
+        _APP_DEVICE_HEADER = ("device_id=%s&device_type=%s&iid=%s"
+                              % (device_id, model, install_id))
+        return _APP_DEVICE_HEADER
+
+
+def _rhex_byte(n):
+    return int(format(n, "02x")[::-1], 16)
+
+
+def _rbin_byte(n):
+    return int(format(n, "08b")[::-1], 2)
+
+
+def _app_xgorgon(path, params):
+    """shareBookSource.json 中 xGorgon() 的 0404b0d30000 版本。"""
+    parts = [params, "aid=1967", "channel=0", "os_version=0",
+             "app_name=novelapp", "version_code=99999",
+             "device_platform=android", _app_device_header()]
+    query = "&".join(sorted(p for p in parts if p))
+    url = APP_META_HOST + "/reading/bookapi/" + path + "/v/?" + query
+
+    hexs = hashlib.md5(query.encode("utf-8")).hexdigest() + "0" * 64
+    key = [0xDF, 0x77, 0xB9, 0x40, 0xB9, 0x9B, 0x84, 0x83,
+           0xD1, 0xB9, 0xCB, 0xD1, 0xF7, 0xC2, 0xB9, 0x85,
+           0xC3, 0xD0, 0xFB, 0xC3]
+    values = []
+    for i in range(0, 9, 4):
+        chunk = hexs[i * 8:(i + 1) * 8]
+        values.extend(int(chunk[j * 2:j * 2 + 2], 16) for j in range(4))
+    ts = int(time.time())
+    values += [0, 6, 11, 28,
+               (ts >> 24) & 255, (ts >> 16) & 255,
+               (ts >> 8) & 255, ts & 255]
+    values = [values[i] ^ key[i % 20] for i in range(20)]
+    for i in range(20):
+        c = _rbin_byte(_rhex_byte(values[i]) ^ values[(i + 1) % 20])
+        values[i] = ((c ^ 0xFFFFFFFF) ^ 20) & 255
+    sig = "0404b0d30000" + "".join("%02x" % v for v in values)
+    return url, {"User-Agent": APP_UA, "X-Khronos": str(ts), "X-Gorgon": sig}
+
+
+def _app_api_json(path, params, timeout=10):
+    url, headers = _app_xgorgon(path, params)
+    raw = _app_http_get(url, headers=headers, timeout=timeout)
+    if not raw.strip():
+        raise RuntimeError("App 接口返回空响应: %s" % path)
+    return json.loads(raw)
+
+
+def app_fetch_search(query, offset=0, count=10):
+    """App 搜索：novel.snssdk.com 公共搜索接口（实测免签名、无 PUA）。"""
+    params = {
+        "aid": "13",
+        "q": query,
+        "offset": str(int(offset)),
+    }
+    url = ("https://novel.snssdk.com/api/novel/channel/homepage/search/search/v1?"
+           + urllib.parse.urlencode(params))
+    j = json.loads(_app_http_get(url, timeout=12))
+    if str(j.get("code")) != "0":
+        raise RuntimeError("App 搜索返回 code=%s：%s"
+                           % (j.get("code"), j.get("message", "")))
+    rows = ((j.get("data") or {}).get("ret_data") or [])
+    out = []
+    for b in rows:
+        name = re.sub(r"</?em>", "", str(b.get("title") or b.get("book_name") or ""))
+        bd = {
+            "book_id": str(b.get("book_id") or ""),
+            "book_name": name,
+            "author_name": str(b.get("author") or b.get("author_name") or ""),
+            "cover_url": b.get("thumb_url") or b.get("cover_url") or "",
+            "abstract": str(b.get("abstract") or ""),
+            "category": str(b.get("category") or ""),
+            "new_chapter_title": str(b.get("last_chapter_title") or ""),
+            "word_number": b.get("word_number") or "",
+            "score": b.get("score") or "",
+        }
+        out.append({"book_data": bd})
+    return {"code": 0,
+            "search_tabs": [{"data": out}],
+            "data": {"search_book_data_list": out}}
+
+
+def app_fetch_detail(book_id):
+    """App 详情：reading.bookapi/detail（X-Gorgon + 设备注册）。"""
+    j = _app_api_json("detail", "book_id=" + urllib.parse.quote(str(book_id), safe=""))
+    d = j.get("page") or j.get("data") or {}
+    if isinstance(d, list):
+        d = d[0] if d else {}
+    if not isinstance(d, dict):
+        d = {}
+    info = d.get("book_info") or d.get("bookInfo") or d
+    name = (info.get("book_name") or info.get("bookName")
+            or info.get("title") or "")
+    if not name:
+        raise RuntimeError("App 详情返回空数据")
+    return {"code": 0, "data": {
+        "book_id": str(info.get("book_id") or info.get("bookId") or book_id),
+        "book_name": dec_text(str(name)),
+        "author_name": dec_text(str(info.get("author") or info.get("author_name") or "")),
+        "cover_url": info.get("thumb_url") or info.get("cover_url") or "",
+        "abstract": dec_text(str(info.get("abstract") or "")),
+        "category": dec_text(str(info.get("category") or "")),
+        "new_chapter_title": dec_text(str(info.get("last_chapter_title") or "")),
+    }}
+
+
+def app_fetch_directory(book_id):
+    """App 目录：reading.bookapi/directory/all_items。"""
+    j = _app_api_json("directory/all_items",
+                      "book_id=" + urllib.parse.quote(str(book_id), safe=""))
+    d = j.get("data") or j.get("page") or {}
+    if isinstance(d, list):
+        d = d[0] if d else {}
+    if not isinstance(d, dict):
+        d = {}
+    items = (d.get("item_data_list") or d.get("itemDataList")
+             or d.get("chapterList") or [])
+    vols = []
+    all_ids = []
+    for c in items:
+        if not isinstance(c, dict):
+            continue
+        iid = str(c.get("item_id") or c.get("itemId") or "")
+        if not iid:
+            continue
+        vname = str(c.get("volume_name") or c.get("volumeName") or "第一卷：默认")
+        if not vols or vols[-1].get("volumeName") != vname:
+            vols.append({
+                "volumeName": vname,
+                "volumeId": str(c.get("volume_id") or c.get("volumeId") or ""),
+                "chapterList": [],
+            })
+        vols[-1]["chapterList"].append({
+            "itemId": iid,
+            "chapter_title": dec_text(str(c.get("title")
+                                          or c.get("chapter_title") or "")),
+            "firstPassTime": c.get("first_pass_time") or c.get("firstPassTime") or "",
+            "chapterWordNumber": (c.get("chapter_word_number")
+                                  or c.get("chapterWordNumber") or ""),
+        })
+        all_ids.append(iid)
+    if not vols:
+        raise RuntimeError("App 目录返回空章节列表")
+    return {"code": 0, "data": {"chapterListWithVolume": vols,
+                                  "allItemIds": all_ids}}
+
+
+# --------------------------------------------------------------------------
 # a_bogus 生成（懒加载，避免重复实例化）
 # --------------------------------------------------------------------------
 _AB = None
@@ -173,7 +401,17 @@ def abogus_for(params_dict):
 # 各路由实现
 # --------------------------------------------------------------------------
 def fetch_search(query, offset=0, count=10):
-    """搜索：/api/author/search/search_book/v1 （需 a_bogus）。"""
+    """搜索：优先 App 公共搜索接口，失败回退 Web（需 a_bogus）。"""
+    if META_CHANNEL != "web":
+        try:
+            return app_fetch_search(query, offset, count)
+        except Exception as e:  # noqa
+            sys.stderr.write("[fanqie] App 搜索失败，回退 Web: %s\n" % e)
+    return _fetch_search_web(query, offset, count)
+
+
+def _fetch_search_web(query, offset=0, count=10):
+    """搜索（Web 回退）：/api/author/search/search_book/v1 （需 a_bogus）。"""
     page_index = int(offset) // int(count) if int(count) else 0
     params = {
         "filter": "127,127,127,127",
@@ -207,7 +445,17 @@ def fetch_search(query, offset=0, count=10):
 
 
 def fetch_detail(book_id):
-    """详情：/api/book/info （免签名）。"""
+    """详情：优先 App reading.bookapi/detail，失败回退 /api/book/info。"""
+    if META_CHANNEL != "web":
+        try:
+            return app_fetch_detail(book_id)
+        except Exception as e:  # noqa
+            sys.stderr.write("[fanqie] App 详情失败，回退 Web: bookId=%s %s\n" % (book_id, e))
+    return _fetch_detail_web(book_id)
+
+
+def _fetch_detail_web(book_id):
+    """详情（Web 回退）：/api/book/info （免签名）。"""
     url = "https://fanqienovel.com/api/book/info?bookId=" + str(book_id)
     j = http_get_json(url, headers={"Referer": REF_BASE + "page/" + str(book_id)})
     d = j.get("data") or {}
@@ -273,7 +521,23 @@ def _norm_directory(vols):
 
 
 def fetch_directory(book_id, page_count=500):
-    """目录：/api/reader/directory/detail （免签名）。
+    """目录：优先 App reading.bookapi/directory/all_items，失败回退 Web。"""
+    book_id = str(book_id)
+    cached = _dir_cache_get(book_id)
+    if cached is not None:
+        return cached
+    if META_CHANNEL != "web":
+        try:
+            result = app_fetch_directory(book_id)
+            _dir_cache_put(book_id, result)
+            return result
+        except Exception as e:  # noqa
+            sys.stderr.write("[fanqie] App 目录失败，回退 Web: bookId=%s %s\n" % (book_id, e))
+    return _fetch_directory_web(book_id, page_count)
+
+
+def _fetch_directory_web(book_id, page_count=500):
+    """目录（Web 回退）：/api/reader/directory/detail （免签名）。
 
     实测：上游忽略 page_num，一次就返回整本书全部章节（allItemIds 即总数）。
     因此这里只请求一次；仅当返回数少于 allItemIds 时才继续翻页，并按 itemId
@@ -540,12 +804,14 @@ if __name__ == "__main__":
             COOKIE = a.split("=", 1)[1].strip()
         elif a.startswith("--channel="):
             CHANNEL = a.split("=", 1)[1].strip().lower() or "app"
+        elif a.startswith("--meta-channel="):
+            META_CHANNEL = a.split("=", 1)[1].strip().lower() or "app"
     if "--test" in args:
         smoke_test()
     else:
         if COOKIE:
             sys.stderr.write("已启用 Web Cookie（锁章可读全文）\n")
-        sys.stderr.write("正文渠道: %s\n"
+        sys.stderr.write("正文渠道: %s；元数据渠道: %s（失败自动回退 Web）\n"
                          % ("app（DH 通道，锁章全文）" if CHANNEL != "web" and appchannel is not None
-                            else "web（锁章仅试读）"))
+                            else "web（锁章仅试读）", META_CHANNEL))
         run_server(port)
