@@ -3,14 +3,13 @@
 """
 番茄小说 代理后端（纯 Python）。
 
-目录/搜索/详情优先 App 渠道（参考 shareBookSource.json）：
-  - 搜索  novel.snssdk.com/api/novel/channel/homepage/search/search/v1（免签名）
-  - 详情  reading.snssdk.com/reading/bookapi/detail/v          （X-Gorgon + 设备注册）
-  - 目录  reading.snssdk.com/reading/bookapi/directory/all_items/v（X-Gorgon + 设备注册）
-App 详情/目录若因签名、设备或环境返回空响应，则自动回退原 Web 接口：
-  - 搜索  /api/author/search/search_book/v1 （需要 a_bogus 网页签名，本地生成）
-  - 详情  /api/book/info                       （免签名）
-  - 目录  /api/reader/directory/detail         （免签名）
+元数据策略（2026-11 实测：App 详情/目录接口在当前出口稳定空 body，故详情/目录仅用官网 Web）：
+  - 详情  仅官网 Web  /api/book/info               （免签名，字段完整）
+  - 目录  仅官网 Web  /api/reader/directory/detail （免签名，一次返回整本）
+  - 搜索  三路聚合：APP bookapi + 头条 novel.snssdk + Web a_bogus，按 book_id 去重合并
+      - APP    api5 /reading/bookapi/search/page 或 xGorgon search/tab（部分 IP 空 body，容错跳过）
+      - 头条   novel.snssdk.com/.../channel/homepage/search/search/v1 aid=2329（免签，精确匹配）
+      - Web    /api/author/search/search_book/v1（a_bogus 网页签名，本地生成）
 
 正文默认走 App 渠道（appchannel.py，移植自 fqapp-master）：
   - novel.snssdk.com/api/novel/book/reader/content/v1
@@ -89,9 +88,10 @@ COOKIE = os.environ.get("FQ_COOKIE", "").strip()
 # 用 FQ_CHANNEL=web 或 --channel=web 关闭 App 渠道。
 CHANNEL = os.environ.get("FQ_CHANNEL", "app").strip().lower() or "app"
 
-# 元数据渠道（搜索/详情/目录）：app 优先，失败自动回退 web。
-# 用 FQ_META_CHANNEL=web 或 --meta-channel=web 可强制走旧网页接口。
+# 说明：详情/目录已固定仅用官网 Web（App 接口在多数出口返回空 body），
+#       META_CHANNEL / DIR_SOURCE 仅保留兼容旧命令行参数，不再影响这两项。
 META_CHANNEL = os.environ.get("FQ_META_CHANNEL", "app").strip().lower() or "app"
+DIR_SOURCE = os.environ.get("FQ_DIR_SOURCE", "auto").strip().lower() or "auto"
 
 # 全局 SSL 上下文（对部分环境放宽校验）
 _SSL_CTX = ssl.create_default_context()
@@ -283,26 +283,80 @@ def _app_api_json(path, params, timeout=10):
     return json.loads(raw)
 
 
-def app_fetch_search(query, offset=0, count=10):
-    """App 搜索：novel.snssdk.com 公共搜索接口（实测免签名、无 PUA）。"""
-    params = {
-        "aid": "13",
-        "q": query,
-        "offset": str(int(offset)),
-    }
+def _search_rows_to_items(rows):
+    """把各搜索源的书籍行统一成书源期望的 {book_data:{...}} 结构。"""
+    out = []
+    for b in rows:
+        name = re.sub(r"</?em>", "", str(b.get("book_name") or b.get("title") or ""))
+        bid = str(b.get("book_id") or b.get("bookId") or "")
+        if not bid or not name:
+            continue
+        out.append({"book_data": {
+            "book_id": bid,
+            "book_name": dec_text(name),
+            "author_name": dec_text(str(b.get("author_name") or b.get("author") or "")),
+            "cover_url": b.get("cover_url") or b.get("thumb_url") or b.get("thumbUri") or "",
+            "abstract": dec_text(str(b.get("abstract") or b.get("book_abstract") or "")),
+            "category": dec_text(str(b.get("category") or "")),
+            "new_chapter_title": dec_text(str(b.get("new_chapter_title") or b.get("last_chapter_title") or "")),
+            "word_number": b.get("word_number") or "",
+            "score": b.get("score") or "",
+        }})
+    return out
+
+
+def toutiao_search(query, offset=0, count=10, aid="2329"):
+    """头条搜索：novel.snssdk.com 频道搜索（免签名、精确匹配，实测可用）。"""
+    params = {"aid": aid, "q": query, "offset": str(int(offset))}
     url = ("https://novel.snssdk.com/api/novel/channel/homepage/search/search/v1?"
            + urllib.parse.urlencode(params))
     j = json.loads(_app_http_get(url, timeout=12))
     if str(j.get("code")) != "0":
-        raise RuntimeError("App 搜索返回 code=%s：%s"
-                           % (j.get("code"), j.get("message", "")))
+        raise RuntimeError("头条搜索 code=%s：%s" % (j.get("code"), j.get("message", "")))
     rows = ((j.get("data") or {}).get("ret_data") or [])
-    out = []
+    items = []
     for b in rows:
-        name = re.sub(r"</?em>", "", str(b.get("title") or b.get("book_name") or ""))
-        bd = {
+        # 头条 title 字段即书名，常带 <em> 高亮标签；thumb_url 有时是签名缩略图，可用
+        title = re.sub(r"</?em>", "", str(b.get("title") or b.get("book_name") or ""))
+        items.append({
             "book_id": str(b.get("book_id") or ""),
-            "book_name": name,
+            "book_name": title,
+            "author_name": str(b.get("author") or ""),
+            "cover_url": b.get("thumb_url") or "",
+            "abstract": str(b.get("abstract") or ""),
+            "category": str(b.get("category") or ""),
+            "new_chapter_title": str(b.get("last_chapter_title") or ""),
+            "word_number": b.get("word_number") or "",
+            "score": b.get("score") or "",
+            "source": "toutiao",
+        })
+    return items
+
+
+def app_fetch_search(query, offset=0, count=10):
+    """APP 搜索：reading.snssdk bookapi search/tab（xGorgon + 设备注册）。
+
+    当前部分出口 IP 返回空 body（实测），聚合时失败会被跳过，不影响其它两路。
+    失败会抛异常，由 fetch_search 捕获。
+    """
+    j = _app_api_json("search/tab",
+                      "tab_type=3&query=%s&passback=%d"
+                      % (urllib.parse.quote(query), int(offset)), timeout=12)
+    if str(j.get("code")) not in ("0", 0):
+        raise RuntimeError("APP 搜索 code=%s" % j.get("code"))
+    tabs = j.get("search_tabs") or []
+    # tab_type=3 通常是「搜书」，兼容取有数据的 tab
+    rows = []
+    for t in tabs:
+        d = t.get("data") or []
+        if d:
+            rows = d
+            break
+    items = []
+    for b in rows:
+        items.append({
+            "book_id": str(b.get("book_id") or ""),
+            "book_name": str(b.get("book_name") or b.get("title") or ""),
             "author_name": str(b.get("author") or b.get("author_name") or ""),
             "cover_url": b.get("thumb_url") or b.get("cover_url") or "",
             "abstract": str(b.get("abstract") or ""),
@@ -310,76 +364,216 @@ def app_fetch_search(query, offset=0, count=10):
             "new_chapter_title": str(b.get("last_chapter_title") or ""),
             "word_number": b.get("word_number") or "",
             "score": b.get("score") or "",
-        }
-        out.append({"book_data": bd})
-    return {"code": 0,
-            "search_tabs": [{"data": out}],
-            "data": {"search_book_data_list": out}}
+            "source": "app",
+        })
+    return items
+
+
+# --------------------------------------------------------------------------
+# App 元数据辅助：借「正文接口」拿 novel_data（含书籍元数据 + next_item_id）
+# 说明：reading.bookapi/detail 与 directory/all_items 在部分出口 IP 会被静默
+#       拒绝（返回空 body）。正文接口 reader/content 用的是另一套签名
+#       （x-ladon/x-argus），实测稳定可用；其 novel_data 同时带书籍元数据、
+#       章节标题、字数和 next/pre_item_id，可据此拼出详情与整本目录。
+# --------------------------------------------------------------------------
+def _app_novel_meta(item_id, timeout=12):
+    """用正文渠道签名请求，只取 novel_data（不解密正文），返回 dict。"""
+    if appchannel is None:
+        raise RuntimeError("appchannel 不可用")
+    query = appchannel.build_query(item_id)
+    y, a = appchannel.generate_y()
+    ts = int(time.time())
+    headers = {
+        "User-Agent": appchannel.UA_NOVEL,
+        "Accept-Encoding": "gzip, deflate",
+        "y": y,
+        "x-ss-req-ticket": str(ts * 1000),
+        "x-khronos": str(ts),
+        "x-ladon": appchannel.ladon_encrypt(ts, appchannel._LC_ID, 13),
+        "x-argus": appchannel.argus_sign(query, ts, 13, appchannel._LC_ID),
+    }
+    url = appchannel.HOST_CONTENT + "?" + query
+    req = urllib.request.Request(url, headers=headers)
+    resp = urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX)
+    body = resp.read()
+    if ((resp.headers.get("content-encoding") or "").lower() == "gzip"
+            or body[:2] == b"\x1f\x8b"):
+        body = gzip.decompress(body)
+    j = json.loads(body.decode("utf-8", "ignore"))
+    if str(j.get("code")) not in ("0", 0):
+        raise RuntimeError("正文元数据接口 code=%s" % j.get("code"))
+    return (j.get("data") or {}).get("novel_data") or {}
+
+
+def _app_first_item(book_id, timeout=12):
+    """用 App 搜索结果里的 item_schema_url 提取该书首章 item_id。"""
+    url = ("https://novel.snssdk.com/api/novel/channel/homepage/search/search/v1?"
+           + urllib.parse.urlencode({"aid": "13", "q": str(book_id), "offset": "0"}))
+    # 按书号直接搜常搜不到，改为按书名搜（详情调用方通常有书名；这里再兜底）
+    j = json.loads(_app_http_get(url, timeout=timeout))
+    rows = ((j.get("data") or {}).get("ret_data") or [])
+    for b in rows:
+        if str(b.get("book_id")) == str(book_id):
+            schema = urllib.parse.unquote(str(b.get("item_schema_url") or ""))
+            m = re.search(r"item_id=(\d+)", schema)
+            if m:
+                return m.group(1)
+    # 没精确命中：取第一条结果的 item_id（按书号搜索 Book_id 相关时通常就是它）
+    if rows:
+        schema = urllib.parse.unquote(str(rows[0].get("item_schema_url") or ""))
+        m = re.search(r"item_id=(\d+)", schema)
+        if m and str(rows[0].get("book_id")) == str(book_id):
+            return m.group(1)
+    return ""
+
+
+def _app_first_item_by_name(name, book_id, timeout=12):
+    """按书名搜，命中指定 book_id 时返回其首章 item_id 和书籍元数据。"""
+    url = ("https://novel.snssdk.com/api/novel/channel/homepage/search/search/v1?"
+           + urllib.parse.urlencode({"aid": "13", "q": name, "offset": "0"}))
+    j = json.loads(_app_http_get(url, timeout=timeout))
+    rows = ((j.get("data") or {}).get("ret_data") or [])
+    for b in rows:
+        if str(b.get("book_id")) == str(book_id):
+            schema = urllib.parse.unquote(str(b.get("item_schema_url") or ""))
+            m = re.search(r"item_id=(\d+)", schema)
+            return (m.group(1) if m else ""), b
+    return "", None
 
 
 def app_fetch_detail(book_id):
-    """App 详情：reading.bookapi/detail（X-Gorgon + 设备注册）。"""
-    j = _app_api_json("detail", "book_id=" + urllib.parse.quote(str(book_id), safe=""))
-    d = j.get("page") or j.get("data") or {}
-    if isinstance(d, list):
-        d = d[0] if d else {}
-    if not isinstance(d, dict):
-        d = {}
-    info = d.get("book_info") or d.get("bookInfo") or d
-    name = (info.get("book_name") or info.get("bookName")
-            or info.get("title") or "")
-    if not name:
-        raise RuntimeError("App 详情返回空数据")
+    """App 详情：优先 reading.bookapi，失败则用正文 novel_data 补全（纯 App）。"""
+    # 方案 A：官方详情接口（有些出口 IP 可用）
+    try:
+        j = _app_api_json("detail", "book_id=" + urllib.parse.quote(str(book_id), safe=""))
+        d = j.get("page") or j.get("data") or {}
+        if isinstance(d, list):
+            d = d[0] if d else {}
+        info = (d.get("book_info") or d.get("bookInfo") or d) if isinstance(d, dict) else {}
+        name = (info.get("book_name") or info.get("bookName") or info.get("title") or "")
+        if name:
+            return {"code": 0, "data": {
+                "book_id": str(info.get("book_id") or info.get("bookId") or book_id),
+                "book_name": dec_text(str(name)),
+                "author_name": dec_text(str(info.get("author") or info.get("author_name") or "")),
+                "cover_url": info.get("thumb_url") or info.get("cover_url") or "",
+                "abstract": dec_text(str(info.get("abstract") or "")),
+                "category": dec_text(str(info.get("category") or "")),
+                "new_chapter_title": dec_text(str(info.get("last_chapter_title") or "")),
+            }}
+    except Exception:
+        pass
+
+    # 方案 B：先从 Web 详情拿书名（Web /api/book/info 稳定），再用书名走 App 搜索
+    #         拿首章 item_id，最后用正文 novel_data 补全为完整 App 元数据。
+    web = _fetch_detail_web(book_id)
+    name = (web.get("data") or {}).get("book_name") or ""
+    first_item = ""
+    app_row = None
+    if name:
+        first_item, app_row = _app_first_item_by_name(name, book_id)
+    if not first_item:
+        first_item = _app_first_item(book_id)
+    nv = _app_novel_meta(first_item) if first_item else {}
+    src = nv or (app_row or {})
+    book_name = (nv.get("book_name") or nv.get("title")
+                 or (app_row or {}).get("title") or name)
+    if not book_name:
+        return web  # 实在拿不到 App 数据，回退 Web
+    # 合并：书籍级字段以搜索/Web 为准（novel_data 的首章 word_number/chapter_title
+    # 是「首章」而非全书，不能当书籍字数/最新章节用）；novel_data 只补它独有的字段。
+    web_data = web.get("data") or {}
     return {"code": 0, "data": {
-        "book_id": str(info.get("book_id") or info.get("bookId") or book_id),
-        "book_name": dec_text(str(name)),
-        "author_name": dec_text(str(info.get("author") or info.get("author_name") or "")),
-        "cover_url": info.get("thumb_url") or info.get("cover_url") or "",
-        "abstract": dec_text(str(info.get("abstract") or "")),
-        "category": dec_text(str(info.get("category") or "")),
-        "new_chapter_title": dec_text(str(info.get("last_chapter_title") or "")),
+        "book_id": str(nv.get("book_id") or book_id),
+        "book_name": dec_text(str(book_name)),
+        "author_name": dec_text(str((app_row or {}).get("author")
+                                    or nv.get("author") or web_data.get("author_name") or "")),
+        "cover_url": ((app_row or {}).get("thumb_url")
+                      or nv.get("thumb_url") or web_data.get("cover_url") or ""),
+        "abstract": dec_text(str((app_row or {}).get("abstract")
+                                 or web_data.get("abstract") or "")),
+        "category": dec_text(str((app_row or {}).get("category")
+                                 or nv.get("category") or web_data.get("category") or "")),
+        "new_chapter_title": dec_text(str(web_data.get("new_chapter_title") or "")),
+        "word_number": (app_row or {}).get("word_number") or web_data.get("word_number") or "",
+        "copyright_info": dec_text(str(nv.get("copyright_info") or "")),
+        "source": dec_text(str(nv.get("source") or "")),
+        "isbn": str(nv.get("isbn") or ""),
     }}
 
 
-def app_fetch_directory(book_id):
-    """App 目录：reading.bookapi/directory/all_items。"""
-    j = _app_api_json("directory/all_items",
-                      "book_id=" + urllib.parse.quote(str(book_id), safe=""))
-    d = j.get("data") or j.get("page") or {}
-    if isinstance(d, list):
-        d = d[0] if d else {}
-    if not isinstance(d, dict):
-        d = {}
-    items = (d.get("item_data_list") or d.get("itemDataList")
-             or d.get("chapterList") or [])
-    vols = []
-    all_ids = []
-    for c in items:
-        if not isinstance(c, dict):
-            continue
-        iid = str(c.get("item_id") or c.get("itemId") or "")
-        if not iid:
-            continue
-        vname = str(c.get("volume_name") or c.get("volumeName") or "第一卷：默认")
-        if not vols or vols[-1].get("volumeName") != vname:
-            vols.append({
-                "volumeName": vname,
-                "volumeId": str(c.get("volume_id") or c.get("volumeId") or ""),
-                "chapterList": [],
+def app_fetch_directory(book_id, max_chapters=5000, timeout=12):
+    """App 目录：优先 reading.bookapi，失败则沿 novel_data.next_item_id 链遍历。"""
+    # 方案 A：官方目录接口（有些出口 IP 可用）
+    try:
+        j = _app_api_json("directory/all_items",
+                          "book_id=" + urllib.parse.quote(str(book_id), safe=""))
+        d = j.get("data") or j.get("page") or {}
+        items = ((d.get("item_data_list") or d.get("itemDataList") or d.get("chapterList"))
+                 if isinstance(d, dict) else []) or []
+        vols = []
+        all_ids = []
+        for c in items:
+            if not isinstance(c, dict):
+                continue
+            iid = str(c.get("item_id") or c.get("itemId") or "")
+            if not iid:
+                continue
+            vname = str(c.get("volume_name") or c.get("volumeName") or "第一卷：默认")
+            if not vols or vols[-1].get("volumeName") != vname:
+                vols.append({"volumeName": vname,
+                             "volumeId": str(c.get("volume_id") or c.get("volumeId") or ""),
+                             "chapterList": []})
+            vols[-1]["chapterList"].append({
+                "itemId": iid,
+                "chapter_title": dec_text(str(c.get("title") or c.get("chapter_title") or "")),
+                "firstPassTime": c.get("first_pass_time") or c.get("firstPassTime") or "",
+                "chapterWordNumber": c.get("chapter_word_number") or c.get("chapterWordNumber") or "",
             })
-        vols[-1]["chapterList"].append({
-            "itemId": iid,
-            "chapter_title": dec_text(str(c.get("title")
-                                          or c.get("chapter_title") or "")),
-            "firstPassTime": c.get("first_pass_time") or c.get("firstPassTime") or "",
-            "chapterWordNumber": (c.get("chapter_word_number")
-                                  or c.get("chapterWordNumber") or ""),
+            all_ids.append(iid)
+        if vols:
+            return {"code": 0, "data": {"chapterListWithVolume": vols, "allItemIds": all_ids}}
+    except Exception:
+        pass
+
+    # 方案 B：从首章沿 next_item_id 链遍历（正文接口签名可用）
+    # 先取首章：按书号搜不到时用 Web 详情拿书名再搜
+    first_item = _app_first_item(book_id)
+    if not first_item:
+        try:
+            web = _fetch_detail_web(book_id)
+            name = (web.get("data") or {}).get("book_name") or ""
+            if name:
+                first_item, _ = _app_first_item_by_name(name, book_id)
+        except Exception:
+            pass
+    if not first_item:
+        raise RuntimeError("App 目录无法定位首章 item_id")
+
+    chapters = []
+    seen = set()
+    cur = first_item
+    while cur and cur not in seen and len(chapters) < max_chapters:
+        seen.add(cur)
+        nv = _app_novel_meta(cur, timeout=timeout)
+        chapters.append({
+            "itemId": cur,
+            "chapter_title": dec_text(str(nv.get("chapter_title")
+                                          or nv.get("origin_chapter_title") or "")),
+            "firstPassTime": nv.get("first_pass_time") or "",
+            "chapterWordNumber": nv.get("word_number") or "",
         })
-        all_ids.append(iid)
-    if not vols:
-        raise RuntimeError("App 目录返回空章节列表")
-    return {"code": 0, "data": {"chapterListWithVolume": vols,
-                                  "allItemIds": all_ids}}
+        cur = str(nv.get("next_item_id") or "")
+    if not chapters:
+        raise RuntimeError("App 目录遍历无结果")
+    return {"code": 0, "data": {
+        "chapterListWithVolume": [{
+            "volumeName": "正文卷",
+            "volumeId": "",
+            "chapterList": chapters,
+        }],
+        "allItemIds": [c["itemId"] for c in chapters],
+    }}
 
 
 # --------------------------------------------------------------------------
@@ -400,18 +594,68 @@ def abogus_for(params_dict):
 # --------------------------------------------------------------------------
 # 各路由实现
 # --------------------------------------------------------------------------
+# 搜索聚合时每路最多取多少条（避免某路刷屏，头条/Web 各 10 条典型）
+_SEARCH_PER_SOURCE = int(os.environ.get("FQ_SEARCH_PER_SOURCE", "10") or 10)
+# 聚合结果总上限
+_SEARCH_TOTAL = int(os.environ.get("FQ_SEARCH_TOTAL", "30") or 30)
+
+
 def fetch_search(query, offset=0, count=10):
-    """搜索：优先 App 公共搜索接口，失败回退 Web（需 a_bogus）。"""
-    if META_CHANNEL != "web":
-        try:
-            return app_fetch_search(query, offset, count)
-        except Exception as e:  # noqa
-            sys.stderr.write("[fanqie] App 搜索失败，回退 Web: %s\n" % e)
-    return _fetch_search_web(query, offset, count)
+    """搜索聚合：APP（xGorgon）+ 头条（免签）+ Web（a_bogus）三路合一。
+
+    各路独立容错，任一成功即可返回；按 book_id 去重，先成功的源优先，
+    后续源只补空缺字段（如某路无字数/评分）。返回结构保持与单路一致，
+    兼容 番茄小说书源.json 的 ruleSearch。
+    """
+    per = max(int(count), _SEARCH_PER_SOURCE)
+    collected = []       # item 列表（带 source）
+    seen_ids = set()
+
+    def absorb(items, name):
+        for it in (items or []):
+            bid = str(it.get("book_id") or "")
+            if not bid:
+                continue
+            if bid in seen_ids:
+                # 已存在：仅补齐空缺字段（不覆盖先到源的值）
+                for prev in collected:
+                    if str(prev.get("book_id")) == bid:
+                        for k, v in it.items():
+                            if k == "source":
+                                continue
+                            if not prev.get(k) and v:
+                                prev[k] = v
+                        break
+                continue
+            seen_ids.add(bid)
+            collected.append(dict(it))
+
+    # 1) 头条（当前出口最稳、精确匹配）
+    try:
+        absorb(toutiao_search(query, offset, per), "toutiao")
+    except Exception as e:  # noqa
+        sys.stderr.write("[fanqie] 头条搜索失败: %s\n" % e)
+
+    # 2) Web（需 a_bogus，字段较全）
+    try:
+        absorb(_fetch_search_web(query, offset, per), "web")
+    except Exception as e:  # noqa
+        sys.stderr.write("[fanqie] Web 搜索失败: %s\n" % e)
+
+    # 3) APP（xGorgon + 设备注册；部分 IP 空 body，失败跳过）
+    try:
+        absorb(app_fetch_search(query, offset, per), "app")
+    except Exception as e:  # noqa
+        sys.stderr.write("[fanqie] APP 搜索失败: %s\n" % e)
+
+    collected = collected[:_SEARCH_TOTAL]
+    out = _search_rows_to_items(collected)
+    return {"code": 0, "search_tabs": [{"data": out}],
+            "data": {"search_book_data_list": out}}
 
 
 def _fetch_search_web(query, offset=0, count=10):
-    """搜索（Web 回退）：/api/author/search/search_book/v1 （需 a_bogus）。"""
+    """搜索（Web）：/api/author/search/search_book/v1 （需 a_bogus，本地生成）。"""
     page_index = int(offset) // int(count) if int(count) else 0
     params = {
         "filter": "127,127,127,127",
@@ -427,38 +671,51 @@ def _fetch_search_web(query, offset=0, count=10):
         msg = j.get("message", "未知错误")
         raise RuntimeError("搜索接口返回 code=%s：%s" % (j.get("code"), msg))
     books = (j.get("data") or {}).get("search_book_data_list") or []
-    out = []
+    items = []
     for b in books:
-        bd = {
-            "book_id": b.get("book_id"),
+        items.append({
+            "book_id": str(b.get("book_id") or ""),
             "book_name": dec_search(b.get("book_name")),
             "author_name": dec_search(b.get("author")),
-            "cover_url": b.get("thumb_url") or b.get("thumb_uri"),
+            "cover_url": b.get("thumb_url") or b.get("thumb_uri") or "",
             "abstract": dec_search(b.get("book_abstract")),
             "category": dec_search(b.get("category")),
             "new_chapter_title": dec_search(b.get("last_chapter_title")),
-        }
-        # 套一层 book_data 以匹配 番茄小说书源.json 的 ruleSearch 子规则
-        out.append({"book_data": bd})
-    return {"code": 0, "search_tabs": [{"data": out}],
-            "data": {"search_book_data_list": out}}
+            "word_number": b.get("word_number") or "",
+            "score": "",
+            "source": "web",
+        })
+    return items
 
 
 def fetch_detail(book_id):
-    """详情：优先 App reading.bookapi/detail，失败回退 /api/book/info。"""
-    if META_CHANNEL != "web":
-        try:
-            return app_fetch_detail(book_id)
-        except Exception as e:  # noqa
-            sys.stderr.write("[fanqie] App 详情失败，回退 Web: bookId=%s %s\n" % (book_id, e))
+    """详情：仅官网 Web /api/book/info（免签名，字段完整）。
+
+    App reading.bookapi/detail 在当前出口稳定空 body，且需要 X-Gorgon +
+    设备注册，收益低，故不再作为详情来源。
+    """
     return _fetch_detail_web(book_id)
 
 
+def _category_from_v2(raw):
+    """从 categoryV2（JSON 数组字符串）里取分类名，兼容空 category/completeCategory。"""
+    if not raw:
+        return ""
+    try:
+        arr = json.loads(raw) if isinstance(raw, str) else raw
+        names = [str(x.get("Name") or "") for x in arr if isinstance(x, dict) and x.get("Name")]
+        return " ".join(names)
+    except Exception:
+        return str(raw) if isinstance(raw, str) else ""
+
+
 def _fetch_detail_web(book_id):
-    """详情（Web 回退）：/api/book/info （免签名）。"""
+    """详情：官网 Web /api/book/info （免签名）。"""
     url = "https://fanqienovel.com/api/book/info?bookId=" + str(book_id)
     j = http_get_json(url, headers={"Referer": REF_BASE + "page/" + str(book_id)})
     d = j.get("data") or {}
+    category = (d.get("category") or d.get("completeCategory")
+                or _category_from_v2(d.get("categoryV2")))
     return {
         "code": 0,
         "data": {
@@ -467,8 +724,12 @@ def _fetch_detail_web(book_id):
             "author_name": dec_text(d.get("author")),
             "cover_url": d.get("thumbUrl") or d.get("thumbUri"),
             "abstract": dec_text(d.get("abstract")),
-            "category": dec_text(d.get("category") or d.get("completeCategory")),
+            "category": dec_text(category),
             "new_chapter_title": dec_text(d.get("lastChapterTitle")),
+            "word_number": d.get("wordNumber") or "",
+            "last_chapter_update_time": d.get("lastPublishTime") or "",
+            "read_count": d.get("readCount") or "",
+            "creation_status": d.get("creationStatus") if d.get("creationStatus") is not None else "",
         },
     }
 
@@ -521,19 +782,22 @@ def _norm_directory(vols):
 
 
 def fetch_directory(book_id, page_count=500):
-    """目录：优先 App reading.bookapi/directory/all_items，失败回退 Web。"""
+    """目录：仅官网 Web /api/reader/directory/detail（免签名，一次返回整本）。
+
+    App directory/all_items 在当前出口稳定空 body；App 链遍历（沿
+    next_item_id）虽可用但首本约 30 秒，收益低，故不再作为目录来源。
+    """
     book_id = str(book_id)
     cached = _dir_cache_get(book_id)
     if cached is not None:
         return cached
-    if META_CHANNEL != "web":
-        try:
-            result = app_fetch_directory(book_id)
-            _dir_cache_put(book_id, result)
-            return result
-        except Exception as e:  # noqa
-            sys.stderr.write("[fanqie] App 目录失败，回退 Web: bookId=%s %s\n" % (book_id, e))
-    return _fetch_directory_web(book_id, page_count)
+    try:
+        r = _fetch_directory_web(book_id, page_count)
+        _dir_cache_put(book_id, r)
+        return r
+    except Exception as e:  # noqa
+        sys.stderr.write("[fanqie] Web 目录失败: bookId=%s %s\n" % (book_id, e))
+        return {"code": -1, "data": {"chapterListWithVolume": []}}
 
 
 def _fetch_directory_web(book_id, page_count=500):
@@ -773,10 +1037,17 @@ def run_server(port=18921):
 
 def smoke_test():
     print("== 番茄小说网页版后端冒烟测试 ==")
-    # 1) 搜索
-    r = fetch_search("我的")
-    books = r["data"]["search_book_data_list"]
-    books = [b["book_data"] for b in books]
+    # 1) 搜索（带重试，避免偶发网络抖动）
+    books = []
+    for _ in range(3):
+        r = fetch_search("西游记")
+        books = [b["book_data"] for b in r["data"]["search_book_data_list"]]
+        if books:
+            break
+        time.sleep(0.5)
+    if not books:
+        print("[搜索] 失败：接口连续 3 次返回空")
+        return
     print("[搜索] 命中 %d 本，首本：%s / %s" % (len(books), books[0]["book_name"], books[0]["author_name"]))
     bid = books[0]["book_id"]
     # 2) 详情
@@ -806,12 +1077,14 @@ if __name__ == "__main__":
             CHANNEL = a.split("=", 1)[1].strip().lower() or "app"
         elif a.startswith("--meta-channel="):
             META_CHANNEL = a.split("=", 1)[1].strip().lower() or "app"
+        elif a.startswith("--dir-source="):
+            DIR_SOURCE = a.split("=", 1)[1].strip().lower() or "auto"
     if "--test" in args:
         smoke_test()
     else:
         if COOKIE:
             sys.stderr.write("已启用 Web Cookie（锁章可读全文）\n")
-        sys.stderr.write("正文渠道: %s；元数据渠道: %s（失败自动回退 Web）\n"
+        sys.stderr.write("正文渠道: %s；详情/目录: 仅官网 Web；搜索: APP+头条+Web 三路聚合去重\n"
                          % ("app（DH 通道，锁章全文）" if CHANNEL != "web" and appchannel is not None
-                            else "web（锁章仅试读）", META_CHANNEL))
+                            else "web（锁章仅试读）"))
         run_server(port)
