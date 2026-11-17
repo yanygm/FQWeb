@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name             番茄全文在线免费读
-// @version          5.7.4-progress
-// @description       自建后端替换番茄网页正文：锁章全文、正文图片、阅读页「下载全文」、详情页一键下载全本；v5.7.4：语音朗读防中断、断点续读
-// @description:zh-cn 自建后端替换番茄网页正文：锁章全文、正文图片、阅读页「下载全文」、详情页一键下载全本；v5.7.4：语音朗读防中断、断点续读
-// @description:en    Replace fanqienovel web content with a self-hosted API; locked chapters, images, full-book download; v5.7.4: TTS anti-drop and resume
+// @version          5.8.3-progress
+// @description       自建后端替换番茄网页正文：锁章全文、正文图片、阅读进度上报、阅读页「下载全文」、详情页一键下载全本；所有书自动替换正文并上报进度，「脚本读」按钮仅给受限书提供手动入口；阅读页左上角返回统一回书架
+// @description:zh-cn 自建后端替换番茄网页正文：锁章全文、正文图片、阅读进度上报、阅读页「下载全文」、详情页一键下载全本；所有书自动替换正文并上报进度，「脚本读」按钮仅给受限书提供手动入口；阅读页左上角返回统一回书架
+// @description:en    Replace fanqienovel web content with a self-hosted API; locked chapters, images, progress report, full-book download; all books auto-replace content & report progress, "Script read" button only for copyright-restricted books; reader back button always goes to bookshelf
 // @author            ibxff / 修改版
 // @license           MIT
 // @match             https://fanqienovel.com/*
@@ -250,6 +250,108 @@
     if (kind === 'ok') setTimeout(function () { if (badge) badge.style.opacity = '0'; }, 2500);
   }
 
+  // 所有书在阅读页都会自动用自建后端替换正文并上报进度（脚本核心功能）。
+  // 「脚本读」按钮/标记只用于受限书的手动入口：官网不给正文时，从书架/详情页点它可直接进入。
+  // 标记仍保留（openScriptReader 写入），但正文替换不再依赖它。
+  var SCRIPT_ITEM_KEY = 'fq_script_item_';
+  var SCRIPT_BOOK_KEY = 'fq_script_book_';
+
+  function setScriptReadFlag(bookId, itemId) {
+    try {
+      if (itemId) sessionStorage.setItem(SCRIPT_ITEM_KEY + itemId, '1');
+      if (bookId) sessionStorage.setItem(SCRIPT_BOOK_KEY + bookId, '1');
+    } catch (e) { /* ignore */ }
+  }
+
+  function clearScriptReadFlag(bookId, itemId) {
+    try {
+      if (itemId) sessionStorage.removeItem(SCRIPT_ITEM_KEY + itemId);
+      if (bookId) sessionStorage.removeItem(SCRIPT_BOOK_KEY + bookId);
+    } catch (e) { /* ignore */ }
+  }
+
+  function isScriptRead(bookId, itemId) {
+    try {
+      if (itemId && sessionStorage.getItem(SCRIPT_ITEM_KEY + itemId) === '1') return true;
+      if (bookId && sessionStorage.getItem(SCRIPT_BOOK_KEY + bookId) === '1') return true;
+    } catch (e) { /* ignore */ }
+    return false;
+  }
+
+  // 服务端版权字段（来自书架 multidetail）：受限书 final_platform_visibility=0、
+  // item_show_title 为空、real_chapter_order='0'。前端只读这些字段判断，不改官网状态。
+  function isRestrictedMeta(meta) {
+    if (!meta || typeof meta !== 'object') return false;
+    if (meta.final_platform_visibility !== undefined &&
+        String(meta.final_platform_visibility) === '0') return true;
+    if (meta.item_show_title !== undefined &&
+        String(meta.item_show_title) === '') return true;
+    if (meta.real_chapter_order !== undefined &&
+        String(meta.real_chapter_order) === '0') return true;
+    if (String(meta.genre || '').toUpperCase() === 'OTHER') return true;
+    return false;
+  }
+
+  function hasCopyrightNotice(text) {
+    return /因版权问题|暂不支持浏览器阅读/.test(String(text || ''));
+  }
+
+  // 阅读页兜底识别：正文容器空 + 页面状态里带受限字段时，自动切到脚本读。
+  function isRestrictedBookPage() {
+    if (hasCopyrightNotice(document.body && document.body.innerText)) return true;
+    try {
+      var html = document.documentElement.innerHTML || '';
+      if (/"final_platform_visibility"\s*:\s*"?0"?/.test(html)) return true;
+      if (/"real_chapter_order"\s*:\s*"?0"?/.test(html)) return true;
+      if (/"item_show_title"\s*:\s*""/.test(html)) return true;
+    } catch (e) { /* ignore */ }
+    return false;
+  }
+
+  // 用自建后端打开一本书：优先续读上次章节 -> 书架 itemId -> 目录第一章。
+  // bookId / itemId 至少给一个。
+  async function openScriptReader(bookId, itemId) {
+    if (!bookId && !itemId) { showBadge('未获取到书籍信息', 'warn'); return; }
+    var target = '';
+    // 续读：若该书有记忆进度，优先回到上次读到的章节
+    if (bookId) {
+      var remembered = getLastItem(bookId);
+      if (remembered) target = remembered;
+    }
+    if (!target) target = itemId || '';
+    if (!target && bookId) {
+      showBadge('正在读取目录…', 'info');
+      try {
+        var chapters = await fetchDirectory(bookId);
+        if (!chapters.length) throw new Error('目录为空');
+        target = chapters[0].id;
+      } catch (e) {
+        showBadge('读取目录失败：' + e.message, 'err');
+        return;
+      }
+    }
+    if (!target) { showBadge('未找到章节入口', 'warn'); return; }
+    setScriptReadFlag(bookId, target);
+    location.href = '/reader/' + target;
+  }
+
+  function findAddShelfButton() {
+    var exact = document.querySelector('.add-bookshelf-btn');
+    if (exact) return exact;
+    var all = document.querySelectorAll('button, a, div[role="button"]');
+    for (var i = 0; i < all.length; i++) {
+      var t = (all[i].textContent || '').replace(/\s+/g, '');
+      if (t === '加入书架') return all[i];
+    }
+    return null;
+  }
+
+  function findReaderHref() {
+    var a = document.querySelector('.info-btn a[href*="/reader/"]') ||
+            document.querySelector('a[href*="/reader/"]');
+    return a ? a.getAttribute('href') : '';
+  }
+
   // ------------------------------------------------------------------
   // 工具
   // ------------------------------------------------------------------
@@ -292,6 +394,9 @@
   }
 
   function bookIdFromPage() {
+    // 详情页 URL 自带 bookId（/page/<id>），最可靠，优先用
+    var u = String(location.pathname || '').match(/\/page\/(\d{6,})/);
+    if (u) return u[1];
     try {
       var st = window.__INITIAL_STATE__;
       var found = st && deepFind(st, 'bookId');
@@ -532,7 +637,38 @@
       '#fq-autoread .fq-ar-rail-dot.fq-dot-tts.tts-on{background:#1976d2;',
       'box-shadow:0 0 0 2px rgba(25,118,210,.2);}',
       '.muye-reader-content p.fq-speaking{background:rgba(255,106,0,.12);',
-      'border-radius:4px;box-shadow:0 0 0 4px rgba(255,106,0,.12);}'
+      'border-radius:4px;box-shadow:0 0 0 4px rgba(255,106,0,.12);}',
+      // 脚本自建阅读导航：底部翻页条 + 全屏目录抽屉（受限书官网不渲染这些，故自建）
+      '#fq-readnav{position:fixed;left:0;right:0;bottom:0;z-index:2147483646;display:flex;',
+      'align-items:center;justify-content:center;gap:14px;padding:9px 14px;',
+      'background:rgba(255,255,255,.97);color:#222;border-top:1px solid rgba(0,0,0,.08);',
+      'box-shadow:0 -3px 16px rgba(0,0,0,.12);font:13px/1.4 system-ui,-apple-system,',
+      '"PingFang SC","Microsoft YaHei",sans-serif;user-select:none;}',
+      '#fq-readnav button{cursor:pointer;border:1px solid #ddd;background:#fff;color:#333;',
+      'border-radius:6px;padding:6px 14px;font-size:13px;min-width:74px;}',
+      '#fq-readnav button:hover:not(:disabled){border-color:#ff6a00;color:#ff6a00;}',
+      '#fq-readnav button:disabled{opacity:.4;cursor:not-allowed;}',
+      '#fq-readnav .fq-rn-info{text-align:center;min-width:132px;font-variant-numeric:tabular-nums;}',
+      '#fq-readnav .fq-rn-prog{color:#ff6a00;font-weight:600;font-size:12px;}',
+      '#fq-readnav .fq-rn-title{color:#888;font-size:11px;max-width:230px;',
+      'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:0 auto;}',
+      '#fq-toc-drawer{position:fixed;inset:0;z-index:2147483646;display:none;',
+      'background:rgba(0,0,0,.4);align-items:flex-end;justify-content:center;}',
+      '#fq-toc-drawer.fq-open{display:flex;}',
+      '#fq-toc-drawer .fq-toc-panel{width:min(560px,94vw);max-height:78vh;display:flex;',
+      'flex-direction:column;background:#fff;border-radius:14px 14px 0 0;overflow:hidden;',
+      'box-shadow:0 -6px 30px rgba(0,0,0,.25);}',
+      '#fq-toc-drawer .fq-toc-head{display:flex;align-items:center;justify-content:space-between;',
+      'padding:14px 18px;border-bottom:1px solid #eee;font-weight:600;font-size:15px;}',
+      '#fq-toc-drawer .fq-toc-head button{cursor:pointer;border:0;background:#f5f5f5;',
+      'border-radius:6px;padding:4px 12px;font-size:13px;color:#555;}',
+      '#fq-toc-drawer .fq-toc-list{overflow:auto;padding:6px 0;flex:1;}',
+      '#fq-toc-drawer .fq-toc-item{padding:10px 18px;font-size:13px;color:#333;cursor:pointer;',
+      'border-bottom:1px solid #fafafa;display:flex;gap:10px;align-items:baseline;}',
+      '#fq-toc-drawer .fq-toc-item:hover{background:#faf5f0;}',
+      '#fq-toc-drawer .fq-toc-item.fq-cur{color:#ff6a00;font-weight:600;background:#fff6ef;}',
+      '#fq-toc-drawer .fq-toc-idx{color:#bbb;font-size:11px;min-width:30px;text-align:right;}',
+      '#fq-toc-drawer .fq-toc-status{padding:16px;color:#999;font-size:13px;text-align:center;}'
     ].join('\n');
     (document.head || document.documentElement).appendChild(s);
   }
@@ -588,6 +724,35 @@
     if (item && !item.querySelector('#fq-dl-btn')) hijackDownloadItem();
   }
 
+  // ------------------------------------------------------------------
+  // 官网阅读页左上角返回：统一「返回书架」
+  // 目标元素：.muye-reader-nav-title（标题/返回区）、.muyeicon-icon-reader-icon-back（返回图标）
+  // 官网原逻辑可能走 history.back()（回到上一页），这里强制跳到书架。
+  // ------------------------------------------------------------------
+  var backHijacked = false;
+
+  function goBackToShelf() {
+    location.href = '/bookshelf';
+  }
+
+  function hijackReaderBack() {
+    if (backHijacked) return;
+    backHijacked = true;
+    // 捕获阶段拦截，先于 React 根容器的合成事件，官网回退逻辑不会再执行
+    document.addEventListener('click', function (e) {
+      if (!isReader()) return;
+      var t = e.target;
+      if (!t || !t.closest) return;
+      var hit = t.closest('.muye-reader-nav-title') ||
+                t.closest('.muyeicon-icon-reader-icon-back');
+      if (!hit) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+      goBackToShelf();
+    }, true);
+  }
+
   async function ensureBook() {
     if (currentBook && currentBook.id) return currentBook;
 
@@ -637,6 +802,37 @@
 
   var CONTENT_ANCHOR = '<span data-fq-anchor style="display:none"></span>';
   var lastRender = { itemId: '', html: '' };   // 最近一次成功渲染的正文，用于稳态自愈
+
+  // ------------------------------------------------------------------
+  // 脚本自建阅读导航：目录驱动翻页 + 进度显示 + 续读记忆
+  // 版权受限书官网不渲染目录/上一章/下一章，这里完全自建，不依赖官网 DOM。
+  // ------------------------------------------------------------------
+  var LAST_ITEM_KEY = 'fq_last_item_';   // + bookId -> 最后阅读的 itemId
+  var readNav = { bookId: '', chapters: [], index: -1, panel: null, drawer: null };
+
+  function rememberLastItem(bookId, itemId) {
+    if (bookId && itemId) ssSet(LAST_ITEM_KEY + bookId, String(itemId));
+  }
+  function getLastItem(bookId) {
+    var v = bookId ? ssGet(LAST_ITEM_KEY + bookId) : '';
+    return (v && /^\d{6,}$/.test(v)) ? v : '';
+  }
+
+  // 带标题的目录，复用 dirCache（10 分钟有效），供导航与进度上报共用
+  function getDirWithTitles(bookId) {
+    var cached = dirCache[bookId];
+    if (cached && cached.list && Date.now() - cached.ts < 10 * 60 * 1000) {
+      return Promise.resolve(cached.list);
+    }
+    return fetchDirectory(bookId).then(function (list) {
+      var we = dirCache[bookId] || {};
+      we.list = list;
+      we.ids = list.map(function (c) { return String(c.id); });
+      we.ts = Date.now();
+      dirCache[bookId] = we;
+      return list;
+    });
+  }
 
   function getBox() { return document.querySelector('.muye-reader-content'); }
 
@@ -753,11 +949,235 @@
     }, 200);
   }
 
+  // 构建底部翻页条 + 目录抽屉（只建一次）
+  function ensureReadNavDom() {
+    if (readNav.panel && document.body && document.body.contains(readNav.panel)) return;
+    if (!document.body) return;
+
+    var nav = document.createElement('div');
+    nav.id = 'fq-readnav';
+
+    var prev = document.createElement('button');
+    prev.className = 'fq-rn-prev';
+    prev.textContent = '← 上一章';
+    prev.addEventListener('click', function () { stepChapter(-1); });
+    nav.appendChild(prev);
+
+    var info = document.createElement('div');
+    info.className = 'fq-rn-info';
+    var prog = document.createElement('div');
+    prog.className = 'fq-rn-prog';
+    prog.textContent = '目录加载中…';
+    var title = document.createElement('div');
+    title.className = 'fq-rn-title';
+    info.appendChild(prog);
+    info.appendChild(title);
+    nav.appendChild(info);
+
+    var tocBtn = document.createElement('button');
+    tocBtn.className = 'fq-rn-toc';
+    tocBtn.textContent = '目录';
+    tocBtn.addEventListener('click', openTocDrawer);
+    nav.appendChild(tocBtn);
+
+    var next = document.createElement('button');
+    next.className = 'fq-rn-next';
+    next.textContent = '下一章 →';
+    next.addEventListener('click', function () { stepChapter(1); });
+    nav.appendChild(next);
+
+    var drawer = document.createElement('div');
+    drawer.id = 'fq-toc-drawer';
+    var dpanel = document.createElement('div');
+    dpanel.className = 'fq-toc-panel';
+    var dhead = document.createElement('div');
+    dhead.className = 'fq-toc-head';
+    var dtitle = document.createElement('span');
+    dtitle.className = 'fq-toc-title';
+    dtitle.textContent = '目录';
+    dhead.appendChild(dtitle);
+    var dclose = document.createElement('button');
+    dclose.textContent = '关闭';
+    dclose.addEventListener('click', closeTocDrawer);
+    dhead.appendChild(dclose);
+    dpanel.appendChild(dhead);
+    var dlist = document.createElement('div');
+    dlist.className = 'fq-toc-list';
+    dpanel.appendChild(dlist);
+    drawer.appendChild(dpanel);
+    drawer.addEventListener('click', function (e) {
+      if (e.target === drawer) closeTocDrawer();
+    });
+
+    document.body.appendChild(nav);
+    document.body.appendChild(drawer);
+    readNav.panel = nav;
+    readNav.drawer = drawer;
+  }
+
+  function removeReadNavDom() {
+    [readNav.panel, readNav.drawer].forEach(function (el) {
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+    });
+    readNav.panel = null;
+    readNav.drawer = null;
+    readNav.bookId = '';
+    readNav.chapters = [];
+    readNav.index = -1;
+  }
+
+  function updateReadNav() {
+    var nav = readNav.panel;
+    if (!nav) return;
+    var total = readNav.chapters.length;
+    var idx = readNav.index;
+    var prog = nav.querySelector('.fq-rn-prog');
+    var title = nav.querySelector('.fq-rn-title');
+    var prev = nav.querySelector('.fq-rn-prev');
+    var next = nav.querySelector('.fq-rn-next');
+    if (prog) {
+      prog.textContent = total
+        ? ('第 ' + (idx >= 0 ? idx + 1 : '?') + ' / 共 ' + total + ' 章')
+        : '目录加载中…';
+    }
+    if (title) {
+      var ch = idx >= 0 ? readNav.chapters[idx] : null;
+      title.textContent = ch && ch.title ? ch.title : '';
+    }
+    if (prev) prev.disabled = idx <= 0;
+    if (next) next.disabled = idx < 0 || idx >= total - 1;
+  }
+
+  // 加载目录并按当前章节定位导航（每个阅读页调用）
+  function setupReadNav(bookId, itemId) {
+    if (!bookId || !itemId || !isReader()) return;
+    readNav.bookId = String(bookId);
+    ensureReadNavDom();
+    updateReadNav();
+    getDirWithTitles(bookId).then(function (list) {
+      if (!isReader() || readNav.bookId !== String(bookId)) return;
+      readNav.chapters = list;
+      var pos = -1;
+      for (var i = 0; i < list.length; i++) {
+        if (String(list[i].id) === String(itemId)) { pos = i; break; }
+      }
+      readNav.index = pos;
+      rememberLastItem(bookId, itemId);
+      updateReadNav();
+      renderToc();
+    }).catch(function (e) {
+      var prog = readNav.panel && readNav.panel.querySelector('.fq-rn-prog');
+      if (prog) prog.textContent = '目录加载失败';
+      var dl = document.querySelector('#fq-toc-drawer .fq-toc-list');
+      if (dl) dl.innerHTML = '<div class="fq-toc-status">目录加载失败：' + escapeHtml(e.message) + '</div>';
+    });
+  }
+
+  function renderToc() {
+    var dlist = document.querySelector('#fq-toc-drawer .fq-toc-list');
+    if (!dlist) return;
+    if (!readNav.chapters.length) {
+      dlist.innerHTML = '<div class="fq-toc-status">目录加载中…</div>';
+      return;
+    }
+    var cur = itemIdFromUrl(location.pathname) || (readNav.index >= 0 ? readNav.chapters[readNav.index].id : '');
+    var html = '';
+    for (var i = 0; i < readNav.chapters.length; i++) {
+      var c = readNav.chapters[i];
+      var active = String(c.id) === String(cur) ? ' fq-cur' : '';
+      html += '<div class="fq-toc-item' + active + '" data-fq-id="' + escapeAttr(c.id) + '">' +
+              '<span class="fq-toc-idx">' + (i + 1) + '</span>' +
+              '<span>' + escapeHtml(c.title || ('第' + (i + 1) + '章')) + '</span></div>';
+    }
+    dlist.innerHTML = html;
+    Array.prototype.forEach.call(dlist.querySelectorAll('.fq-toc-item'), function (it) {
+      it.addEventListener('click', function () {
+        gotoChapter(this.getAttribute('data-fq-id'));
+      });
+    });
+    // 把当前章滚到可见
+    var curEl = dlist.querySelector('.fq-cur');
+    if (curEl && curEl.scrollIntoView) {
+      try { curEl.scrollIntoView({ block: 'center' }); } catch (e) { }
+    }
+  }
+
+  function openTocDrawer() {
+    if (!readNav.drawer) return;
+    renderToc();
+    readNav.drawer.classList.add('fq-open');
+  }
+  function closeTocDrawer() {
+    if (readNav.drawer) readNav.drawer.classList.remove('fq-open');
+  }
+
+  // 按目录顺序翻章；目录没加载好时用当前 URL 的 ID 兜底从 fetchDirectory 找
+  function stepChapter(delta) {
+    var target = '';
+    var cur = itemIdFromUrl(location.pathname);
+    if (readNav.chapters.length) {
+      var pos = -1;
+      for (var i = 0; i < readNav.chapters.length; i++) {
+        if (String(readNav.chapters[i].id) === String(cur)) { pos = i; break; }
+      }
+      var next = pos + delta;
+      if (pos === -1 || next < 0 || next >= readNav.chapters.length) return;
+      target = String(readNav.chapters[next].id);
+    } else {
+      gotoNextChapterById();   // 异步兜底
+      return;
+    }
+    gotoChapter(target);
+  }
+
+  function gotoChapter(itemId) {
+    if (!itemId) return;
+    closeTocDrawer();
+    if (readNav.bookId) rememberLastItem(readNav.bookId, itemId);
+    ssSet('fq_autoread_on', ssGet('fq_autoread_on') || '0');  // 维持自动阅读开关状态
+    location.href = '/reader/' + itemId;
+  }
+
+  // 普通书：保留官网正文，只监听官网内容加载完成，供自动阅读/语音使用。
+  // 若官网正文一直为空且页面带受限版权字段，自动补上脚本读标记。
+  var officialWatchToken = 0;
+  function watchOfficialContent(itemId) {
+    var token = ++officialWatchToken;
+    var start = Date.now();
+    var timer = setInterval(function () {
+      if (token !== officialWatchToken || !isReader() ||
+          itemIdFromUrl(location.pathname) !== String(itemId)) {
+        clearInterval(timer);
+        return;
+      }
+      var box = getBox();
+      var text = box ? String(box.textContent || '').replace(/\s+/g, '') : '';
+      if (text.length > 30) {
+        clearInterval(timer);
+        try { notifyAutoReadContentLoaded(); } catch (e) { console.warn('[fq] autoRead 通知异常', e); }
+        try { notifySpeechContentLoaded(); } catch (e) { console.warn('[fq] 语音通知异常', e); }
+        return;
+      }
+      if (Date.now() - start > 3500) {
+        clearInterval(timer);
+        if (isRestrictedBookPage()) {
+          setScriptReadFlag(bookIdFromPage(), itemId);
+          runReader(itemId);
+        }
+      }
+    }, 300);
+  }
+
   async function runReader(itemId) {
     var token = ++readerToken;
-    showLoading();                               // 先清空旧章内容
     var box = await waitFor(getBox, 10000);
     if (!box) { showBadge('未找到正文容器，页面结构可能已变', 'err'); return; }
+    if (token !== readerToken) return;
+
+    // 所有书统一用自建后端替换正文（锁章全文 + 正文图片）并上报阅读进度，
+    // 这是脚本的核心功能；「脚本读」按钮只针对受限书，是官网不给正文时的手动入口。
+    showLoading();                               // 先清空旧章内容
+    box = getBox() || box;
     if (token === readerToken) showLoading();     // 容器可能刚被重建
     var stopLoading = guardLoading(token);
 
@@ -781,6 +1201,10 @@
         var bid = bookIdFromPage();
         if (bid) currentBook = { id: bid, name: bookNameFromPage() || ch.bookName || '' };
       }
+      // 自建阅读导航（受限书官网无目录/翻页，这里自建）
+      if (currentBook && currentBook.id) {
+        try { setupReadNav(currentBook.id, itemId); } catch (ne) { console.warn('[fq] 阅读导航异常', ne); }
+      }
 
       var imgCount = countImages(ch.content);
       var extra = ch.preview ? '（后端仅返回试读）' : '';
@@ -797,8 +1221,16 @@
       showBadge('正文加载失败：' + e.message, 'err');
       var eb = getBox();
       if (eb) {
-        eb.innerHTML = '<div class="fq-loading" style="color:#c62828">正文加载失败：' +
-                       escapeHtml(e.message) + '</div>';
+        eb.innerHTML = '<div class="fq-loading" style="color:#c62828;flex-direction:column">' +
+                       '<div>正文加载失败：' + escapeHtml(e.message) + '</div>' +
+                       '<div style="font-size:11px;color:#999;margin-top:4px">请确认自建后端已启动（127.0.0.1:18921）</div>' +
+                       '<button class="fq-retry-load" style="margin-top:10px;padding:6px 14px;' +
+                       'border:1px solid #ff6a00;border-radius:6px;background:#fff6ef;color:#ff6a00;' +
+                       'cursor:pointer;font-size:12px">重试加载正文</button></div>';
+        var retryBtn = eb.querySelector('.fq-retry-load');
+        if (retryBtn) {
+          retryBtn.addEventListener('click', function () { runReader(itemId); });
+        }
       }
     }
   }
@@ -1161,6 +1593,16 @@
     autoRead.atBottomSince = 0;
     showBadge('自动翻到下一章…', 'info');
     try {
+      // 自建目录已加载时，按目录 ID 翻章最可靠（受限书官网无「下一章」按钮）
+      var curId = itemIdFromUrl(location.pathname);
+      var pos = -1;
+      for (var i = 0; i < readNav.chapters.length; i++) {
+        if (String(readNav.chapters[i].id) === String(curId)) { pos = i; break; }
+      }
+      if (pos >= 0 && pos + 1 < readNav.chapters.length) {
+        gotoChapter(String(readNav.chapters[pos + 1].id));
+        return;
+      }
       var link = findNextChapterLink();
       if (link) { link.click(); return; }
       var ok = await gotoNextChapterById();
@@ -1226,6 +1668,7 @@
   }
 
   function resetAutoReadForChapter() {
+    closeTocDrawer();
     if (!autoRead.on) return;
     autoRead.atBottomSince = 0;
     autoRead.lastTs = 0;
@@ -1895,6 +2338,7 @@
     var lastUrl = '';
     injectStyle();
     hijackDownloadItem();
+    hijackReaderBack();
     restoreAutoReadState();
     installAutoReadHooks();
     installSpeechHooks();
@@ -1953,6 +2397,14 @@
     return list;
   }
 
+  // 详情页「脚本读本章」：优先用页面上的阅读入口章节，否则从后端目录取第一章
+  function readFromBookPage() {
+    var bid = bookIdFromPage();
+    var href = findReaderHref();
+    var iid = href ? itemIdFromUrl(href) : '';
+    openScriptReader(bid, iid);
+  }
+
   function ensurePanel() {
     if (panel && document.body && document.body.contains(panel)) return panel;
 
@@ -1985,9 +2437,18 @@
       downloadAllFromPage(btn);
     });
 
+    var shelfBtn = document.createElement('button');
+    shelfBtn.className = 'fq-shelf-btn';
+    shelfBtn.textContent = '脚本读本章（仅受限书）';
+    shelfBtn.style.cssText = 'width:100%;padding:7px 0;margin-top:8px;border:1px solid #ff6a00;' +
+                             'border-radius:6px;cursor:pointer;background:#fff6ef;color:#ff6a00;' +
+                             'font-size:12px;font-weight:600;display:none';
+    shelfBtn.addEventListener('click', readFromBookPage);
+
     panel.appendChild(head);
     panel.appendChild(status);
     panel.appendChild(btn);
+    panel.appendChild(shelfBtn);
     document.body.appendChild(panel);
     return panel;
   }
@@ -2025,9 +2486,149 @@
     var tries = 0;
     (function refresh() {
       var n = collectChapters().length;
-      if (panel && !downloading) panelStatus(n ? '共 ' + n + ' 章，可下载' : '正在读取章节列表…', n ? '#2e7d32' : '#666');
+      var limited = hasCopyrightNotice(document.body && document.body.innerText);
+      var shelfBtn = panel && panel.querySelector('.fq-shelf-btn');
+      if (shelfBtn) shelfBtn.style.display = limited ? '' : 'none';
+      if (panel && !downloading) {
+        if (limited) panelStatus('版权受限：点「脚本读本章」用自建后端阅读', '#ef6c00');
+        else panelStatus(n ? '共 ' + n + ' 章，可下载 / 官网阅读' : '正在读取章节列表…', n ? '#2e7d32' : '#666');
+      }
       if (!n && tries++ < 30) setTimeout(refresh, 500);
     })();
+  }
+
+  // 从 React fiber 里提取 book_id / item_id 及版权受限元数据
+  function bookIdsFromFiber(node) {
+    var result = { bookId: '', itemId: '', restricted: false, meta: {} };
+    var fiber = null;
+    for (var k in node) {
+      if (k.indexOf('__reactFiber$') === 0 || k.indexOf('__reactInternalInstance$') === 0) {
+        fiber = node[k];
+        break;
+      }
+    }
+    var metaKeys = ['final_platform_visibility', 'item_show_title',
+                    'real_chapter_order', 'genre'];
+    var depth = 0;
+    while (fiber && depth++ < 15) {
+      // React 元素的 key（书封 key 就是 book_id）
+      if (!result.bookId && fiber.key && /^\d{6,}$/.test(String(fiber.key))) {
+        result.bookId = String(fiber.key);
+      }
+      var props = fiber.memoizedProps || fiber.pendingProps || null;
+      if (props) {
+        var b = props.book || props.data || props.item || null;
+        var bd = props.bookDetail || props.detail || props.book_detail || null;
+        [b, bd, props].forEach(function (o) {
+          if (!o || typeof o !== 'object') return;
+          metaKeys.forEach(function (mk) {
+            if (result.meta[mk] === undefined && o[mk] !== undefined) {
+              result.meta[mk] = o[mk];
+            }
+          });
+        });
+        var bid = (b && (b.book_id || b.bookId)) || (bd && (bd.book_id || bd.bookId)) ||
+                  props.book_id || props.bookId;
+        var iid = (bd && (bd.item_id || bd.itemId)) || (b && (b.item_id || b.itemId)) ||
+                  props.item_id || props.itemId;
+        if (bid && /^\d{6,}$/.test(String(bid))) result.bookId = String(bid);
+        if (iid && /^\d{6,}$/.test(String(iid))) result.itemId = String(iid);
+      }
+      if (result.bookId && result.itemId && result.restricted) break;
+      fiber = fiber.return;
+    }
+    result.restricted = isRestrictedMeta(result.meta);
+    return result;
+  }
+
+  function makeShelfReadButton(bid, iid) {
+    var b = document.createElement('div');
+    b.className = 'fq-shelf-read';
+    b.textContent = '脚本读';
+    b.title = '仅版权受限书：用自建后端阅读';
+    if (bid) b.setAttribute('data-fq-bid', bid);
+    if (iid) b.setAttribute('data-fq-iid', iid);
+    b.style.cssText = 'position:absolute;top:4px;right:4px;z-index:99999;padding:2px 6px;' +
+      'background:#ff6a00;color:#fff;border-radius:4px;font-size:11px;line-height:1.4;' +
+      'cursor:pointer;opacity:.95;box-shadow:0 1px 5px rgba(0,0,0,.3)';
+    b.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();   // 阻止冒泡到书卡的 onClick（否则受限书只弹版权 toast）
+      openScriptReader(this.getAttribute('data-fq-bid') || '',
+                       this.getAttribute('data-fq-iid') || '');
+    });
+    return b;
+  }
+
+  // ------------------------------------------------------------------
+  // 书架/列表页：仅给版权受限书卡片注入「脚本读」入口，绕过官网版权弹窗
+  // ------------------------------------------------------------------
+  var shelfInjectTimer = null;
+  function injectShelfReadButtons() {
+    if (!document.body || isReader()) return;
+
+    var pageLimited = hasCopyrightNotice(document.body && document.body.innerText);
+
+    // 策略 A：详情页/搜索页里的 <a href="/page/..."> 链接（仅受限书）
+    var links = document.querySelectorAll('a[href*="/page/"]');
+    for (var i = 0; i < links.length; i++) {
+      var a = links[i];
+      if (a.getAttribute('data-fq-read-bound') === '1') continue;
+      var m = String(a.getAttribute('href') || '').match(/\/page\/(\d{6,})/);
+      if (!m) continue;
+      var idsA = bookIdsFromFiber(a);
+      if (!pageLimited && !idsA.restricted) continue;   // 普通书不显示脚本读
+      a.setAttribute('data-fq-read-bound', '1');
+      var hostA = a;
+      var pa = a.parentElement;
+      for (var ja = 0; ja < 4 && pa; ja++) {
+        var posA = '';
+        try { posA = (window.getComputedStyle && window.getComputedStyle(pa).position) || ''; } catch (e) { }
+        if (posA === 'relative' || posA === 'absolute' || posA === 'fixed') { hostA = pa; break; }
+        pa = pa.parentElement;
+      }
+      if (hostA === a) { try { a.style.position = 'relative'; } catch (e) { } }
+      hostA.appendChild(makeShelfReadButton(m[1], ''));
+    }
+
+    // 策略 B：书架页 React 书卡 div.book-card（无 <a href>），从 fiber 取 book_id / item_id
+    // 只取根节点（class 含 "book-card-"，排除 book-card__normal / book-card-skeleton 等子元素）
+    var allCardish = document.querySelectorAll('div[class*="book-card"]');
+    var cards = [];
+    for (var q = 0; q < allCardish.length; q++) {
+      var cls = String(allCardish[q].className || '');
+      if (/\bbook-card-\w+/.test(cls) && !/__/.test(cls) && cls.indexOf('skeleton') < 0) {
+        cards.push(allCardish[q]);
+      }
+    }
+    for (var j = 0; j < cards.length; j++) {
+      var card = cards[j];
+      if (card.getAttribute('data-fq-read-bound') === '1') continue;
+      var ids = bookIdsFromFiber(card);
+      // 兜底：从封面图节点（key=book_id）再取一次
+      if (!ids.bookId && card.querySelector) {
+        var cover = card.querySelector('[class*="book-group-cover-image"]');
+        if (cover) {
+          var cids = bookIdsFromFiber(cover);
+          if (cids.bookId) ids.bookId = cids.bookId;
+          if (cids.itemId) ids.itemId = cids.itemId;
+          if (cids.restricted) { ids.restricted = true; ids.meta = cids.meta; }
+        }
+      }
+      if (!ids.bookId && !ids.itemId) continue;   // 拿不到 ID，等下次扫描（React 可能还没渲染好）
+      if (!ids.restricted) continue;              // 普通书走官网，不注入脚本读
+      card.setAttribute('data-fq-read-bound', '1');
+      var pos = '';
+      try { pos = (window.getComputedStyle && window.getComputedStyle(card).position) || ''; } catch (e) { }
+      if (pos === 'static') { try { card.style.position = 'relative'; } catch (e) { } }
+      card.appendChild(makeShelfReadButton(ids.bookId, ids.itemId));
+    }
+  }
+
+  function watchShelf() {
+    if (shelfInjectTimer) return;
+    shelfInjectTimer = setInterval(injectShelfReadButtons, 1000);
+    injectShelfReadButtons();
   }
 
   // ------------------------------------------------------------------
@@ -2078,21 +2679,34 @@
         ensureAutoReadPanel();
         setAutoReadCollapsed(!autoRead.panel.classList.contains('fq-collapsed'));
       });
+      GM_registerMenuCommand('重新加载自建正文', function () {
+        if (!isReader()) {
+          showBadge('请到小说阅读页再重新加载正文', 'warn');
+          return;
+        }
+        var id = itemIdFromUrl(location.pathname);
+        setScriptReadFlag(bookIdFromPage(), id);
+        showBadge('正在用自建后端重新加载正文…', 'info');
+        runReader(id);
+      });
     }
     if (isReader()) {
-        removePanel();
-        watchReader();
-    } else if (isBookPage()) {
       removePanel();
-      removeAutoReadPanel();
-      stopAutoRead(true);
-      stopSpeech(true);
-      watchBookPage();
+      watchReader();
     } else {
-      removePanel();
-      removeAutoReadPanel();
-      stopAutoRead(true);
-      stopSpeech(true);
+      // 书架页、详情页、首页等非阅读页：注入「脚本读」入口
+      removeReadNavDom();
+      watchShelf();
+      if (isBookPage()) {
+        removeAutoReadPanel();
+        stopAutoRead(true);
+        stopSpeech(true);
+        watchBookPage();
+      } else {
+        removeAutoReadPanel();
+        stopAutoRead(true);
+        stopSpeech(true);
+      }
     }
   }
 
