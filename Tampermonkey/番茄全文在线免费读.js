@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name             番茄全文在线免费读
-// @version          5.7.3-progress
-// @description       自建后端替换番茄网页正文：锁章全文、正文图片、阅读页「下载全文」、详情页一键下载全本；v5.7.3：阅读控制面板可收起到侧边
-// @description:zh-cn 自建后端替换番茄网页正文：锁章全文、正文图片、阅读页「下载全文」、详情页一键下载全本；v5.7.3：阅读控制面板可收起到侧边
-// @description:en    Replace fanqienovel web content with a self-hosted API; locked chapters, images, full-book download; v5.7.3: collapse reader controls to side rail
+// @version          5.7.4-progress
+// @description       自建后端替换番茄网页正文：锁章全文、正文图片、阅读页「下载全文」、详情页一键下载全本；v5.7.4：语音朗读防中断、断点续读
+// @description:zh-cn 自建后端替换番茄网页正文：锁章全文、正文图片、阅读页「下载全文」、详情页一键下载全本；v5.7.4：语音朗读防中断、断点续读
+// @description:en    Replace fanqienovel web content with a self-hosted API; locked chapters, images, full-book download; v5.7.4: TTS anti-drop and resume
 // @author            ibxff / 修改版
 // @license           MIT
 // @match             https://fanqienovel.com/*
@@ -1287,8 +1287,16 @@
     paused: false,
     rate: normTtsRate(ssGet('fq_tts_rate')),
     paragraphs: [],
-    index: 0,
+    units: [],                  // 把长段切成短句，绕开浏览器长文本朗读中断
+    index: 0,                   // 当前段落序号（高亮用）
+    unitIndex: 0,               // 当前短句序号（续读用）
+    unitOffset: 0,              // 当前短句内已经读到的字符偏移
     utterance: null,
+    startedAt: 0,
+    watchdog: 0,
+    keepAlive: 0,
+    retry: 0,
+    cancelGuard: false,         // 主动取消时不要让 onerror 触发自动续读
     voice: null,
     voiceURI: ssGet('fq_tts_voice') || '',  // 用户选择的音色（系统语音唯一标识）
     voicesListenerInstalled: false,
@@ -1296,6 +1304,9 @@
     continuous: false,          // 朗读完是否自动翻下一章继续听
     pendingStartOnLoad: false
   };
+
+  var TTS_POS_KEY = 'fq_tts_pos_v1';
+  var TTS_CHUNK_LEN = 56;       // 约 10 秒/句（1.0x），降低 Chrome 长文本中断概率
 
   function ttsSupported() {
     return !!(window && window.speechSynthesis &&
@@ -1388,12 +1399,11 @@
     ssSet('fq_tts_voice', tts.voiceURI);
     updateSpeechPanel();
     if (tts.speaking && tts.utterance) {
-      var idx = tts.index;
-      tts.utterance.onend = null;
-      tts.utterance.onerror = null;
-      try { window.speechSynthesis.cancel(); } catch (e) { }
+      var ui = tts.unitIndex;
+      var off = tts.unitOffset || 0;
+      cancelCurrentUtterance();
       tts.paused = false;
-      speakParagraph(idx);
+      speakUnit(ui, off);
     }
     showBadge('朗读声音：' + (v ? (v.name || v.lang) : '系统默认'), 'info');
   }
@@ -1404,6 +1414,80 @@
     return Array.prototype.slice.call(box.querySelectorAll('p'))
       .map(function (p) { return (p.textContent || '').replace(/\s+/g, ' ').trim(); })
       .filter(function (s) { return s.length > 0; });
+  }
+
+  function currentReaderItemId() {
+    var id = itemIdFromUrl(location.pathname);
+    return id ? String(id) : '';
+  }
+
+  // 长段切成短句：浏览器（尤其 Chrome）朗读长文本容易中途断掉
+  function splitSpeechParagraph(text, pIndex) {
+    var s = String(text || '');
+    var out = [];
+    var start = 0;
+    while (start < s.length) {
+      var end = Math.min(start + TTS_CHUNK_LEN, s.length);
+      if (end < s.length) {
+        var seg = s.slice(start, end);
+        var cuts = /[，。！？；、,.!?;：:\s]/g;
+        var best = -1, m;
+        while ((m = cuts.exec(seg)) !== null) best = m.index;
+        if (best >= Math.floor(TTS_CHUNK_LEN * 0.55)) end = start + best + 1;
+      }
+      var chunk = s.slice(start, end);
+      if (chunk.replace(/\s/g, '')) {
+        out.push({ pIndex: pIndex, start: start, text: chunk });
+      }
+      start = end;
+    }
+    return out;
+  }
+
+  function buildSpeechUnits(paragraphs) {
+    var units = [];
+    for (var i = 0; i < paragraphs.length; i++) {
+      Array.prototype.push.apply(units, splitSpeechParagraph(paragraphs[i], i));
+    }
+    return units;
+  }
+
+  function unitIndexFor(pIndex, offset) {
+    offset = Math.max(0, Number(offset) || 0);
+    var i, u;
+    for (i = 0; i < tts.units.length; i++) {
+      u = tts.units[i];
+      if (u.pIndex === pIndex && offset >= u.start && offset < u.start + u.text.length) return i;
+    }
+    for (i = 0; i < tts.units.length; i++) {
+      if (tts.units[i].pIndex === pIndex) return i;
+    }
+    return 0;
+  }
+
+  function saveTtsPosition() {
+    var u = tts.units[tts.unitIndex];
+    if (!u) return;
+    ssSet(TTS_POS_KEY, JSON.stringify({
+      itemId: currentReaderItemId(),
+      unit: tts.unitIndex,
+      offset: Math.max(0, tts.unitOffset || 0),
+      p: u.pIndex
+    }));
+  }
+
+  function loadTtsPosition() {
+    try {
+      var raw = ssGet(TTS_POS_KEY);
+      if (!raw) return null;
+      var o = JSON.parse(raw);
+      if (!o || o.itemId !== currentReaderItemId()) return null;
+      return o;
+    } catch (e) { return null; }
+  }
+
+  function clearTtsPosition() {
+    ssSet(TTS_POS_KEY, '');
   }
 
   function clearSpeechHighlight() {
@@ -1465,45 +1549,141 @@
     }
   }
 
+  function clearSpeechWatchdog() {
+    if (tts.watchdog) { clearTimeout(tts.watchdog); tts.watchdog = 0; }
+  }
+
+  function stopSpeechKeepAlive() {
+    if (tts.keepAlive) { clearInterval(tts.keepAlive); tts.keepAlive = 0; }
+  }
+
+  // Chrome/Edge 长时间朗读会自己断；定期 pause/resume 可显著降低概率
+  function startSpeechKeepAlive() {
+    stopSpeechKeepAlive();
+    tts.keepAlive = setInterval(function () {
+      if (!tts.speaking || tts.paused || !window.speechSynthesis.speaking) return;
+      try { window.speechSynthesis.pause(); window.speechSynthesis.resume(); } catch (e) { }
+    }, 8000);
+  }
+
+  function cancelCurrentUtterance() {
+    clearSpeechWatchdog();
+    tts.cancelGuard = true;
+    if (tts.utterance) {
+      tts.utterance.onend = null;
+      tts.utterance.onerror = null;
+      tts.utterance = null;
+    }
+    try { window.speechSynthesis.cancel(); } catch (e) { }
+  }
+
+  function armSpeechWatchdog(utterance, text) {
+    clearSpeechWatchdog();
+    var est = Math.max(4000, text.length * 260 / Math.max(0.1, tts.rate));
+    var wait = Math.min(60000, Math.max(8000, est * 2));
+    tts.watchdog = setTimeout(function () {
+      if (!tts.speaking || tts.paused || tts.utterance !== utterance) return;
+      console.warn('[fq-tts] 朗读无响应，自动续读');
+      handleSpeechBreak(tts.unitIndex, tts.unitOffset, true);
+    }, wait);
+  }
+
+  // 朗读意外中断：从当前短句重试几次，仍失败才跳到下一句
+  function handleSpeechBreak(ui, offset, fromWatchdog) {
+    if (!tts.speaking || tts.paused) return;
+    clearSpeechWatchdog();
+    var unit = tts.units[ui];
+    if (!unit) { speakUnit(ui + 1, 0); return; }
+    if (tts.retry < 3) {
+      tts.retry++;
+      cancelCurrentUtterance();
+      var delay = fromWatchdog ? 120 : 300;
+      setTimeout(function () {
+        if (tts.speaking && !tts.paused) speakUnit(ui, offset, true);
+      }, delay);
+    } else {
+      tts.retry = 0;
+      speakUnit(ui + 1, 0);
+    }
+  }
+
+  function speakUnit(ui, offset, keepRetry) {
+    clearSpeechWatchdog();
+    if (!tts.speaking) return;
+    ui = Math.max(0, Number(ui) || 0);
+    offset = Math.max(0, Number(offset) || 0);
+    if (ui >= tts.units.length) { onSpeechChapterDone(); return; }
+    if (!keepRetry) tts.retry = 0;
+
+    var unit = tts.units[ui];
+    var text = unit.text;
+    if (offset > 0) text = text.slice(offset);
+    if (!text) { speakUnit(ui + 1, 0); return; }
+
+    tts.unitIndex = ui;
+    tts.unitOffset = offset;
+    tts.index = unit.pIndex;
+    highlightSpeechParagraph(unit.pIndex);
+    saveTtsPosition();
+
+    var utterance = new window.SpeechSynthesisUtterance(text);
+    utterance.lang = 'zh-CN';
+    utterance.rate = tts.rate;
+    utterance.pitch = 1;
+    utterance.volume = 1;
+    if (tts.voice) utterance.voice = tts.voice;
+    tts.utterance = utterance;
+    tts.startedAt = Date.now();
+    tts.cancelGuard = false;
+
+    utterance.onend = function () {
+      if (!tts.speaking || tts.paused || tts.utterance !== utterance) return;
+      var elapsed = Date.now() - tts.startedAt;
+      var minMs = Math.min(3000, Math.max(500, text.length * 90 / Math.max(0.1, tts.rate)));
+      if (elapsed < minMs && tts.retry < 3) {
+        tts.retry++;
+        cancelCurrentUtterance();
+        setTimeout(function () {
+          if (tts.speaking && !tts.paused) speakUnit(ui, offset, true);
+        }, 250);
+        return;
+      }
+      tts.retry = 0;
+      speakUnit(ui + 1, 0);
+    };
+
+    utterance.onerror = function (ev) {
+      if (!tts.speaking || tts.utterance !== utterance || tts.cancelGuard) return;
+      console.warn('[fq-tts] 朗读中断：', ev && ev.error);
+      if (tts.retry < 3) {
+        tts.retry++;
+        cancelCurrentUtterance();
+        setTimeout(function () {
+          if (tts.speaking && !tts.paused) speakUnit(ui, offset, true);
+        }, 300);
+      } else {
+        tts.retry = 0;
+        stopSpeech(true);
+        showBadge('语音朗读多次中断，已停止', 'warn');
+      }
+    };
+
+    startSpeechKeepAlive();
+    armSpeechWatchdog(utterance, text);
+    try { window.speechSynthesis.speak(utterance); }
+    catch (e) {
+      handleSpeechBreak(ui, offset, true);
+    }
+  }
+
+  // 兼容段落 + 段内偏移的调用（鼠标选区续读）
   function speakParagraph(i, offset) {
     if (!tts.speaking || tts.paused) return;
     if (i >= tts.paragraphs.length) { onSpeechChapterDone(); return; }
-
-    tts.index = i;
-    highlightSpeechParagraph(i);
-
-    // 从选中位置续读：仅当前段截取从 offset 起的文字
-    var text = tts.paragraphs[i];
-    if (offset > 0 && typeof text === 'string') {
-      text = text.slice(offset);
-      if (!text) { speakParagraph(i + 1); return; }
-    }
-    var u = new window.SpeechSynthesisUtterance(text);
-    u.lang = 'zh-CN';
-    u.rate = tts.rate;
-    u.pitch = 1;
-    u.volume = 1;
-    if (tts.voice) u.voice = tts.voice;
-    tts.utterance = u;
-
-    u.onend = function () {
-      if (!tts.speaking || tts.paused) return;
-      speakParagraph(i + 1);
-    };
-    u.onerror = function (ev) {
-      if (!tts.speaking) return;
-      var err = ev && ev.error;
-      if (err === 'interrupted' || err === 'canceled') return;
-      console.warn('[fq-tts] 朗读出错：', err);
-      stopSpeech(true);
-      showBadge('语音朗读出错，已停止', 'warn');
-    };
-
-    try { window.speechSynthesis.speak(u); }
-    catch (e) {
-      stopSpeech(true);
-      showBadge('语音朗读启动失败：' + e.message, 'err');
-    }
+    var ui = unitIndexFor(i, offset || 0);
+    var unit = tts.units[ui];
+    var local = unit ? Math.max(0, (offset || 0) - unit.start) : 0;
+    speakUnit(ui, local);
   }
 
   // 鼠标选中正文后，从选中位置续读
@@ -1543,12 +1723,7 @@
     if (offset < 0 || offset >= paraText.length) offset = 0;
 
     // 取消当前朗读，从选中处重读
-    if (tts.utterance) {
-      tts.utterance.onend = null;
-      tts.utterance.onerror = null;
-      tts.utterance = null;
-    }
-    try { window.speechSynthesis.cancel(); } catch (e) { }
+    cancelCurrentUtterance();
     tts.paused = false;
     updateSpeechPanel();
     showBadge('已从选中位置继续朗读', 'info');
@@ -1575,10 +1750,27 @@
       showBadge('正文还没加载好，暂无可朗读内容', 'warn');
       return;
     }
+    tts.units = buildSpeechUnits(tts.paragraphs);
+    if (!tts.units.length) {
+      showBadge('正文暂无可朗读内容', 'warn');
+      return;
+    }
+
+    // 同一章内重开朗读，从上次停下的短句继续，不再从头开始
+    var saved = loadTtsPosition();
+    var startUnit = 0, startOffset = 0;
+    if (saved && saved.unit >= 0 && saved.unit < tts.units.length) {
+      startUnit = saved.unit;
+      var savedUnit = tts.units[startUnit];
+      startOffset = Math.max(0, Math.min(Number(saved.offset) || 0, savedUnit.text.length - 1));
+    }
 
     tts.speaking = true;
     tts.paused = false;
-    tts.index = 0;
+    tts.unitIndex = startUnit;
+    tts.unitOffset = startOffset;
+    tts.index = tts.units[startUnit].pIndex;
+    tts.retry = 0;
     // 语音朗读始终自动翻下一章；结束、开始均无延迟
     tts.continuous = true;
     // 恢复用户选择的音色，没选过才回退到中文语音
@@ -1593,9 +1785,10 @@
 
     updateSpeechPanel();
     if (!silent) {
-      showBadge(tts.continuous ? '语音朗读已开启（读完自动下一章）' : '语音朗读已开启', 'ok');
+      if (startUnit > 0 || startOffset > 0) showBadge('语音朗读已从上次位置继续', 'ok');
+      else showBadge(tts.continuous ? '语音朗读已开启（读完自动下一章）' : '语音朗读已开启', 'ok');
     }
-    speakParagraph(0);
+    speakUnit(startUnit, startOffset);
   }
 
   function stopSpeech(silent) {
@@ -1603,20 +1796,20 @@
     tts.paused = false;
     tts.pendingStartOnLoad = false;
     tts.continuous = false;
-    if (tts.utterance) {
-      tts.utterance.onend = null;
-      tts.utterance.onerror = null;
-      tts.utterance = null;
-    }
-    try { window.speechSynthesis.cancel(); } catch (e) { }
+    tts.retry = 0;
+    cancelCurrentUtterance();
+    stopSpeechKeepAlive();
     clearSpeechHighlight();
     updateSpeechPanel();
-    if (!silent) showBadge('语音朗读已停止', 'info');
+    // 保留当前章节的朗读位置，下次开启从这里继续
+    if (!silent) showBadge('语音朗读已停止（下次从此处继续）', 'info');
   }
 
   function pauseSpeech() {
     if (!tts.speaking || tts.paused) return;
     tts.paused = true;
+    clearSpeechWatchdog();
+    stopSpeechKeepAlive();
     try { window.speechSynthesis.pause(); } catch (e) { }
     updateSpeechPanel();
     showBadge('语音朗读已暂停', 'info');
@@ -1626,6 +1819,11 @@
     if (!tts.speaking || !tts.paused) return;
     tts.paused = false;
     try { window.speechSynthesis.resume(); } catch (e) { }
+    if (tts.utterance) {
+      var unit = tts.units[tts.unitIndex];
+      if (unit) armSpeechWatchdog(tts.utterance, unit.text.slice(tts.unitOffset || 0));
+    }
+    startSpeechKeepAlive();
     updateSpeechPanel();
     showBadge('语音朗读已继续', 'ok');
   }
@@ -1645,19 +1843,23 @@
     ssSet('fq_tts_rate', String(tts.rate));
     updateSpeechPanel();
     if (tts.speaking && tts.utterance) {
-      var idx = tts.index;
-      tts.utterance.onend = null;
-      tts.utterance.onerror = null;
-      try { window.speechSynthesis.cancel(); } catch (e) { }
+      var ui = tts.unitIndex;
+      var off = tts.unitOffset || 0;
+      cancelCurrentUtterance();
       tts.paused = false;
-      speakParagraph(idx);
+      speakUnit(ui, off);
     }
     showBadge('语音语速：' + fmtSpeed(tts.rate), 'info');
   }
 
   function onSpeechChapterDone() {
+    clearSpeechWatchdog();
+    stopSpeechKeepAlive();
     tts.speaking = false;
     tts.utterance = null;
+    tts.paused = false;
+    tts.retry = 0;
+    clearTtsPosition();
     clearSpeechHighlight();
     updateSpeechPanel();
     if (tts.continuous && isReader()) {
@@ -1868,7 +2070,6 @@
         if (sel && sel.focus) sel.focus();
         showBadge('已在阅读面板中展开声音列表', 'info');
       });
-    }
       GM_registerMenuCommand('展开 / 收起阅读控制面板', function () {
         if (!isReader()) {
           showBadge('请到小说阅读页再使用阅读控制面板', 'warn');
@@ -1877,7 +2078,8 @@
         ensureAutoReadPanel();
         setAutoReadCollapsed(!autoRead.panel.classList.contains('fq-collapsed'));
       });
-      if (isReader()) {
+    }
+    if (isReader()) {
         removePanel();
         watchReader();
     } else if (isBookPage()) {
