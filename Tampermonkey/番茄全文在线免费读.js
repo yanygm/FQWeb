@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name             番茄全文在线免费读
-// @version          5.8.4-tts-continue
+// @version          5.8.6-toc-locate
 // @description       自建后端替换番茄网页正文：锁章全文、正文图片、阅读进度上报、阅读页「下载全文」、详情页一键下载全本；所有书自动替换正文并上报进度，「脚本读」按钮仅给受限书提供手动入口；阅读页左上角返回统一回书架
 // @description:zh-cn 自建后端替换番茄网页正文：锁章全文、正文图片、阅读进度上报、阅读页「下载全文」、详情页一键下载全本；所有书自动替换正文并上报进度，「脚本读」按钮仅给受限书提供手动入口；阅读页左上角返回统一回书架
 // @description:en    Replace fanqienovel web content with a self-hosted API; locked chapters, images, progress report, full-book download; all books auto-replace content & report progress, "Script read" button only for copyright-restricted books; reader back button always goes to bookshelf
@@ -11,6 +11,11 @@
 // @grant             GM_xmlhttpRequest
 // @grant             GM.xmlHttpRequest
 // @grant             GM_registerMenuCommand
+// 自建后端可能在任意域名/本地端口，GM_xmlhttpRequest 跨域必须显式授权，
+// 否则改成线上域名后请求会被 Tampermonkey 拦截（表现为「目录加载失败 / 网络错误」）。
+// @connect            *
+// @connect            localhost
+// @connect            127.0.0.1
 // @run-at            document-idle
 // ==/UserScript==
 
@@ -29,14 +34,15 @@
     (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function')
       ? GM.xmlHttpRequest.bind(GM) : null;
 
-  function getJson(path) {
+  function getJson(path, timeout) {
     var url = API_BASE + path;
+    var to = timeout || FETCH_TIMEOUT;
     if (gmRequest) {
       return new Promise(function (resolve, reject) {
         gmRequest({
           method: 'GET',
           url: url,
-          timeout: FETCH_TIMEOUT,
+          timeout: to,
           headers: { Accept: 'application/json' },
           onload: function (res) {
             if (res.status >= 200 && res.status < 300) {
@@ -53,7 +59,7 @@
     }
     // fetch 回退也要有超时，否则后端挂起会让正文区永久停在 loading（表现为空白页）
     var ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
-    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, FETCH_TIMEOUT) : 0;
+    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, to) : 0;
     return fetch(url, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined })
       .then(function (r) {
         if (timer) clearTimeout(timer);
@@ -87,8 +93,11 @@
     });
   }
 
+  // 目录生成要走 APP 批量章节接口，长书（上千章）可达 15 秒以上，
+  // 用独立长超时，避免被正文的 30 秒超时误伤成「目录加载失败」。
+  var DIR_TIMEOUT = 90000;
   function fetchDirectory(bookId) {
-    return getJson('/api/v1/books/' + encodeURIComponent(bookId) + '/directory').then(function (j) {
+    return getJson('/api/v1/books/' + encodeURIComponent(bookId) + '/directory', DIR_TIMEOUT).then(function (j) {
       if (!j || (j.code !== 0 && j.code !== '0')) {
         throw new Error((j && j.message) || '目录接口异常');
       }
@@ -1073,6 +1082,26 @@
     });
   }
 
+  // 把目录列表滚到当前章。必须在抽屉 display:flex 可见后调用，
+  // 否则 display:none 状态下 scrollIntoView 无效，打开后停在第一章。
+  function scrollTocToCurrent() {
+    var dlist = document.querySelector('#fq-toc-drawer .fq-toc-list');
+    if (!dlist) return;
+    var curEl = dlist.querySelector('.fq-cur');
+    if (!curEl) return;
+    requestAnimationFrame(function () {
+      try {
+        // 用相对列表的几何位置计算，避免 scrollIntoView 连带滚动整个页面
+        var listRect = dlist.getBoundingClientRect();
+        var curRect = curEl.getBoundingClientRect();
+        var delta = (curRect.top - listRect.top) - (dlist.clientHeight - curRect.height) / 2;
+        dlist.scrollTop = Math.max(0, dlist.scrollTop + delta);
+      } catch (e) {
+        try { curEl.scrollIntoView({ block: 'center' }); } catch (e2) { }
+      }
+    });
+  }
+
   function renderToc() {
     var dlist = document.querySelector('#fq-toc-drawer .fq-toc-list');
     if (!dlist) return;
@@ -1080,7 +1109,11 @@
       dlist.innerHTML = '<div class="fq-toc-status">目录加载中…</div>';
       return;
     }
-    var cur = itemIdFromUrl(location.pathname) || (readNav.index >= 0 ? readNav.chapters[readNav.index].id : '');
+    // 当前章优先取 readNav.index（setupReadNav 用正文真实 itemId 精确匹配得到），
+    // 再退回 URL 的 itemId。续读/受限书场景 URL 未必是当前章，不能只信 URL。
+    var cur = (readNav.index >= 0 && readNav.chapters[readNav.index])
+      ? readNav.chapters[readNav.index].id
+      : itemIdFromUrl(location.pathname);
     var html = '';
     for (var i = 0; i < readNav.chapters.length; i++) {
       var c = readNav.chapters[i];
@@ -1095,17 +1128,15 @@
         gotoChapter(this.getAttribute('data-fq-id'));
       });
     });
-    // 把当前章滚到可见
-    var curEl = dlist.querySelector('.fq-cur');
-    if (curEl && curEl.scrollIntoView) {
-      try { curEl.scrollIntoView({ block: 'center' }); } catch (e) { }
-    }
+    // 抽屉已打开时才定位（关闭状态下定位无效，交给 openTocDrawer 处理）
+    if (readNav.drawer && readNav.drawer.classList.contains('fq-open')) scrollTocToCurrent();
   }
 
   function openTocDrawer() {
     if (!readNav.drawer) return;
+    readNav.drawer.classList.add('fq-open');  // 先显示，元素可见后定位才生效
     renderToc();
-    readNav.drawer.classList.add('fq-open');
+    scrollTocToCurrent();                     // 保险：再定位一次
   }
   function closeTocDrawer() {
     if (readNav.drawer) readNav.drawer.classList.remove('fq-open');
