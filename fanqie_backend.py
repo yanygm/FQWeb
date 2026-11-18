@@ -336,6 +336,112 @@ def _app_api_json(path, params, timeout=10):
     return json.loads(raw)
 
 
+def _discovery_book(b):
+    """把 APP 首页流里的 ApiBookInfo 归一化成书卡（明文字段，无需字体解码）。"""
+    if not isinstance(b, dict):
+        return None
+    bid = str(b.get("book_id") or b.get("bookId") or "")
+    name = re.sub(r"</?em>", "", str(b.get("book_name") or b.get("title") or ""))
+    if not bid or not name:
+        return None
+    cover = (b.get("thumb_url") or b.get("cover_url") or b.get("thumb_uri")
+             or b.get("cover_uri") or b.get("expand_thumb_url") or b.get("horiz_thumb_url") or "")
+    return {
+        "book_id": bid,
+        "book_name": dec_search(name),
+        "author_name": dec_search(str(b.get("author") or b.get("author_name") or "")),
+        "cover_url": normalize_cover(cover),
+        "abstract": dec_search(str(b.get("abstract") or b.get("book_abstract_v2")
+                                   or b.get("sub_abstract") or "")),
+        "category": dec_search(str(b.get("category") or b.get("complete_category") or "")),
+        "new_chapter_title": dec_search(str(b.get("last_chapter_title") or b.get("new_chapter_title") or "")),
+        "word_number": b.get("word_number") or "",
+        "score": b.get("score") or "",
+    }
+
+
+# 首页流缓存：cell 列表变化的频度低，缓存 10 分钟避免每次都拉 500KB
+_DISCOVERY_CACHE = {}   # channel -> {groups, ts}
+
+
+def _fetch_homepage_cells(channel, timeout=20):
+    """拉 APP 首页信息流，返回 [{name, books:[书卡]}, ...]。
+
+    channel: male -> bookstore/homepage（男频），female -> bookmall/homepage（女频）。
+    每个 cell 自带 book_data（书卡），cell_name 即推荐/榜单名称。
+    """
+    path = "bookmall/homepage" if str(channel).lower() in ("female", "girl", "女频", "女") \
+        else "bookstore/homepage"
+    cached = _DISCOVERY_CACHE.get(path)
+    if cached and time.time() - cached["ts"] < 600 and cached.get("groups"):
+        return cached["groups"]
+    url, headers = _app_xgorgon(path, "")
+    raw = _app_http_get(url, headers=headers, timeout=timeout)
+    if not raw or not raw.strip():
+        raise RuntimeError("首页流返回空响应: %s" % path)
+    j = json.loads(raw)
+    if str(j.get("code")) != "0":
+        raise RuntimeError("首页流 code=%s" % j.get("code"))
+    groups = []
+    seen_cell = set()
+    for c in (j.get("data") or []):
+        if not isinstance(c, dict):
+            continue
+        name = dec_search(str(c.get("cell_name") or c.get("cell_title") or c.get("title") or "")).strip()
+        bd = c.get("book_data") or c.get("data") or []
+        if isinstance(bd, dict):
+            bd = bd.get("data") or bd.get("book_list") or []
+        books = []
+        for x in (bd if isinstance(bd, list) else []):
+            b = x.get("book_info") if isinstance(x, dict) else None
+            card = _discovery_book(b if isinstance(b, dict) else x)
+            if card:
+                books.append(card)
+        if not books:
+            continue
+        key = name or ("cell_%d" % len(groups))
+        if key in seen_cell:
+            continue
+        seen_cell.add(key)
+        groups.append({"name": name or ("榜单%d" % (len(groups) + 1)), "books": books})
+    if not groups:
+        raise RuntimeError("首页流未解析到书单: %s" % path)
+    _DISCOVERY_CACHE[path] = {"groups": groups, "ts": time.time()}
+    return groups
+
+
+def fetch_discovery(channel="male", cell=None, listing=False):
+    """发现页推荐/榜单。
+
+    listing=True  -> 返回分组元信息（名称 + 数量 + 索引），不返回书卡。
+    cell 为索引数字或分组名 -> 只返回该组书卡（search 风格 {search_tabs:[...]}）。
+    cell 为 None   -> 返回全部分组书卡。
+    """
+    groups = _fetch_homepage_cells(channel)
+    if listing:
+        return {"code": 0, "data": {"groups": [
+            {"index": i, "name": g["name"], "count": len(g["books"])}
+            for i, g in enumerate(groups)
+        ]}}
+    picked = []
+    if cell is None or str(cell) == "":
+        picked = groups
+    else:
+        cs = str(cell)
+        if cs.isdigit():
+            idx = int(cs)
+            if 0 <= idx < len(groups):
+                picked = [groups[idx]]
+        else:
+            for g in groups:
+                if g["name"] == cs:
+                    picked = [g]
+                    break
+    tabs = [{"title": g["name"], "data": [{"book_data": b} for b in g["books"]]}
+            for g in picked]
+    return {"code": 0, "data": {"search_tabs": tabs}}
+
+
 def _search_rows_to_items(rows):
     """把各搜索源的书籍行统一成书源期望的 {book_data:{...}} 结构。
 
@@ -1137,6 +1243,13 @@ def route_search(qs):
     return fetch_search(query, offset, count)
 
 
+def route_discovery(qs):
+    channel = qs.get("channel", ["male"])[0]
+    cell = qs.get("cell", [None])[0]
+    listing = str(qs.get("listing", ["0"])[0]) in ("1", "true", "yes")
+    return fetch_discovery(channel, cell, listing)
+
+
 def route_detail(path):
     m = re.match(r"^/api/v1/books/([^/]+)/detail$", path)
     return fetch_detail(m.group(1))
@@ -1185,6 +1298,8 @@ def dispatch(method, path, qs):
         return route_chapter_details(qs)
     if path == "/api/v1/search" or path.startswith("/api/v1/search?"):
         return route_search(qs)
+    if path == "/api/v1/discovery":
+        return route_discovery(qs)
     if re.match(r"^/api/v1/books/[^/]+/detail$", path):
         return route_detail(path)
     if re.match(r"^/api/v1/books/[^/]+/directory$", path):
